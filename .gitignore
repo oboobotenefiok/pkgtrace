@@ -1,0 +1,55 @@
+# The Basic Ones
+
+/target/
+Cargo.lock
+.env
+
+# Edge Cases
+# Rust
+/target/
+**/*.rs.bk
+*.swp
+*.swo
+*~
+*.log
+*.db
+*.sqlite
+.DS_Store
+.cargo/
+*.code-workspace
+.vscode/
+.idea/
+*.iml
+
+# Build artifacts
+termtrace
+termtrace.exe
+*.o
+*.so
+*.dylib
+*.dll
+
+# Test artifacts
+*.test
+*.prof
+*.gcda
+*.gcno
+
+# Package artifacts
+*.deb
+*.rpm
+*.pkg
+*.tar.gz
+
+# Backup files
+*.backup
+*.old
+*.bak
+
+# Cache
+.cache/
+*.cache
+
+# Logs
+*.log
+logs/
