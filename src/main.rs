@@ -31,7 +31,6 @@ use crate::{
     config::Config,
     tracker::Tracker,
     analyzer::Analyzer,
-    models::*,
 };
 
 #[derive(Parser)]
@@ -159,6 +158,14 @@ enum Commands {
         #[arg(short, long)]
         dry_run: bool,
     },
+    Compare {
+        #[arg(short, long)]
+        file: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    CacheStats,
+    RebuildCache,
 }
 // 👀 In most of my projects, when the main returns a result and all functions are called from main, they mostly also return a result, lol. I need to find a workaround, maybe just for this one to be unique or let's see.
 fn main() -> Result<()> {
@@ -216,6 +223,11 @@ fn main() -> Result<()> {
         Commands::Autoremove { yes, dry_run } => {
             cmd::cmd_autoremove(&tracker, *yes, *dry_run)
         }
+        Commands::Compare { file, output } => {
+            cmd::cmd_compare(&tracker, file, output.as_deref())
+        }
+        Commands::CacheStats => cmd::cmd_cache_stats(&tracker),
+        Commands::RebuildCache => cmd::cmd_rebuild_cache(&tracker),
     };
     // 🦀 If the match above returns an error, we print the error to the developer and exit main, otherwise we do nothing and of course the other side of the code will run, leading to Ok() to satisfy the main return type contract.
     if let Err(e) = result {

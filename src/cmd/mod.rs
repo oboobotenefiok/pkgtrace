@@ -1,17 +1,19 @@
 // THERE ARE SEVENTEEN (17) PUB FUNCTIONS IN HERE
 /// cmd means command
 
-use crate::{
-    tracker::Tracker,
-    models::{PackageSource, PackageStatus, UnusedPackage, Package, DependencyGraph, DependencyNode},
-    utils,
-    analyzer::Analyzer,
-};
-use anyhow::{Result, anyhow};
-use colored::Colorize;
 use std::{
     collections::HashSet,
     io::{self, Write},
+};
+
+use anyhow::Result;
+use colored::Colorize;
+
+use crate::{
+    tracker::Tracker,
+    models::{PackageSource, PackageStatus, Package, DependencyNode},
+    utils,
+    analyzer::Analyzer,
 };
 
 // LIST COMMAND
@@ -22,7 +24,7 @@ pub fn cmd_list(tracker: &Tracker, show_sizes: bool, source: Option<&str>, min_s
     let used_packages = if used_only {
         tracker.get_used_packages()?
     } else {
-        std::collections::HashSet::new()
+        HashSet::new()
         // That's temporary in-memory Database right there.
     };
     
@@ -276,6 +278,9 @@ pub fn cmd_info(tracker: &Tracker, package: &str, verbose: bool) -> Result<()> {
     if let Some(last_used) = info.last_used_date {
         println!("Last used: {}", last_used);
     }
+    if let Some(count) = info.usage_count {
+        println!("Usage count: {}", count);
+    }
     if let Some(deps) = info.dependencies {
         if !deps.is_empty() {
             println!("\nDependencies ({}):", deps.len());
@@ -290,6 +295,11 @@ pub fn cmd_info(tracker: &Tracker, package: &str, verbose: bool) -> Result<()> {
             for dep in reverse_deps {
                 println!("  - {}", dep);
             }
+        }
+    }
+    if verbose {
+        if let Some(checksum) = info.checksum {
+            println!("Checksum: {}", checksum);
         }
     }
     
@@ -648,32 +658,30 @@ pub fn cmd_safe_remove(analyzer: &Analyzer, days: u32, yes: bool, dry_run: bool)
 
 // ============== STATS COMMAND ==============
 pub fn cmd_stats(tracker: &Tracker) -> Result<()> {
-    let packages = tracker.get_installed_packages_all()?;
-    let used = tracker.get_used_packages()?;
-    let total_size: u64 = packages.iter().filter_map(|p| p.size).sum();
-    
-    let mut by_source: std::collections::HashMap<String, (usize, u64)> = std::collections::HashMap::new();
-    for pkg in &packages {
-        let entry = by_source.entry(pkg.source.to_string()).or_insert((0, 0));
-        entry.0 += 1;
-        if let Some(size) = pkg.size {
-            entry.1 += size;
-        }
-    }
+    let stats = tracker.get_stats()?;
     
     println!("Package Statistics");
     println!("{}", "=".repeat(50));
-    println!("Total packages:      {}", packages.len());
-    println!("Used packages:       {}", used.len());
-    println!("Unused packages:     {}", packages.len() - used.len());
-    println!("Total size:          {}", utils::format_size(total_size));
+    println!("Total packages:      {}", stats.total_packages);
+    println!("Used packages:       {}", stats.used_packages);
+    println!("Unused packages:     {}", stats.total_packages - stats.used_packages);
+    println!("Total size:          {}", utils::format_size(stats.total_size));
+    println!("Average size:        {}", utils::format_size(stats.average_package_size));
     println!("\nBy source:");
     
-    let mut sources: Vec<_> = by_source.into_iter().collect();
-    sources.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
-    for (source, (count, size)) in sources {
+    for (source, count, size) in &stats.by_source {
         println!("  {}: {} packages ({} total)", 
-            source, count, utils::format_size(size));
+            source, count, utils::format_size(*size));
+    }
+    
+    if !stats.largest_packages.is_empty() {
+        println!("\nLargest packages:");
+        for pkg in &stats.largest_packages {
+            println!("  - {} ({})", 
+                pkg.name,
+                pkg.size.map(utils::format_size).unwrap_or_else(|| "unknown".to_string())
+            );
+        }
     }
     
     Ok(())
@@ -792,33 +800,55 @@ pub fn cmd_search(tracker: &Tracker, query: &str, source: Option<&str>) -> Resul
 }
 
 // ============== AUTOREMOVE COMMAND ==============
+// FIXED: Now removes packages that are NOT dependencies and NOT used
 pub fn cmd_autoremove(tracker: &Tracker, yes: bool, dry_run: bool) -> Result<()> {
-    let unused = tracker.find_unused_with_deps(0)?;
+    let _all_packages = tracker.get_installed_packages_all()?;
+    let used_packages = tracker.get_used_packages()?;
+    let used_vec: Vec<String> = used_packages.into_iter().collect();
     
-    let autoremove: Vec<_> = unused
+    // Get ALL dependencies of used packages
+    let dependency_set = tracker.get_all_dependencies(&used_vec)?;
+    
+    // Get unused packages (not used in last 30 days)
+    let unused = tracker.find_unused(30)?;
+    
+    // Filter: packages that are USED directly OR are dependencies of used packages should be KEPT
+    // So we REMOVE everything else that's unused
+    let to_remove: Vec<_> = unused
         .into_iter()
-        .filter(|pkg| pkg.status == PackageStatus::Dependency)
+        .filter(|pkg| {
+            // KEEP if it's a dependency of a used package
+            if dependency_set.contains(&pkg.name) {
+                return false;
+            }
+            // KEEP if it's a core package
+            if Tracker::get_core_packages().contains(&pkg.name.as_str()) {
+                return false;
+            }
+            // REMOVE everything else that's unused
+            true
+        })
         .collect();
     
-    if autoremove.is_empty() {
+    if to_remove.is_empty() {
         println!("No packages to autoremove");
         return Ok(());
     }
     
-    let total_size: u64 = autoremove.iter().filter_map(|p| p.size).sum();
-    println!("Found {} packages to autoremove:", autoremove.len());
+    let total_size: u64 = to_remove.iter().filter_map(|p| p.size).sum();
+    println!("Found {} packages to autoremove:", to_remove.len());
     println!("Total size to free: {}", utils::format_size(total_size));
     
-    for pkg in &autoremove {
-        println!("  - {} (dependency, unused)", pkg.name);
+    for pkg in &to_remove {
+        println!("  - {} (unused, not a dependency)", pkg.name);
     }
     
     if dry_run {
-        println!("\nDRY RUN - would remove {} packages", autoremove.len());
+        println!("\nDRY RUN - would remove {} packages", to_remove.len());
         return Ok(());
     }
     
-    if !yes && !confirm_action("Remove these dependency packages?")? {
+    if !yes && !confirm_action("Remove these packages?")? {
         println!("Aborted");
         return Ok(());
     }
@@ -826,7 +856,7 @@ pub fn cmd_autoremove(tracker: &Tracker, yes: bool, dry_run: bool) -> Result<()>
     let mut removed = 0;
     let mut failed = 0;
     
-    for pkg in &autoremove {
+    for pkg in &to_remove {
         match tracker.remove_package(pkg) {
             Ok(_) => {
                 println!("Removed {}", pkg.name);
@@ -840,6 +870,79 @@ pub fn cmd_autoremove(tracker: &Tracker, yes: bool, dry_run: bool) -> Result<()>
     }
     
     println!("\nRemoved: {}, Failed: {}", removed, failed);
+    Ok(())
+}
+
+// ============== COMPARE COMMAND ==============
+// NEW: Compare current packages with an exported file
+pub fn cmd_compare(tracker: &Tracker, file: &str, output: Option<&str>) -> Result<()> {
+    let content = std::fs::read_to_string(file)?;
+    let other_packages: Vec<Package> = serde_json::from_str(&content)?;
+    
+    let analyzer = Analyzer::new(tracker.clone());
+    let comparison = analyzer.compare(&other_packages)?;
+    
+    let mut result = String::new();
+    result.push_str(&format!("Comparison with {}\n", file));
+    result.push_str(&format!("{}\n", "=".repeat(50)));
+    result.push_str(&format!("Common packages: {}\n", comparison.common.len()));
+    result.push_str(&format!("Only in current: {}\n", comparison.only_current.len()));
+    result.push_str(&format!("Only in other: {}\n", comparison.only_other.len()));
+    result.push_str(&format!("Version differences: {}\n\n", comparison.version_differences.len()));
+    
+    if !comparison.only_current.is_empty() {
+        result.push_str("Packages only in current:\n");
+        for pkg in &comparison.only_current {
+            result.push_str(&format!("  - {} ({})\n", pkg.name, pkg.source));
+        }
+        result.push_str("\n");
+    }
+    
+    if !comparison.only_other.is_empty() {
+        result.push_str("Packages only in other:\n");
+        for pkg in &comparison.only_other {
+            result.push_str(&format!("  - {} ({})\n", pkg.name, pkg.source));
+        }
+        result.push_str("\n");
+    }
+    
+    if !comparison.version_differences.is_empty() {
+        result.push_str("Version differences:\n");
+        for diff in &comparison.version_differences {
+            result.push_str(&format!("  {}: {} vs {}\n", 
+                diff.package,
+                diff.current_version.as_deref().unwrap_or("none"),
+                diff.other_version.as_deref().unwrap_or("none")
+            ));
+        }
+    }
+    
+    if let Some(path) = output {
+        std::fs::write(path, result)?;
+        println!("Comparison saved to {}", path);
+    } else {
+        println!("{}", result);
+    }
+    
+    Ok(())
+}
+
+// ============== CACHE STATS COMMAND ==============
+// NEW: Show cache performance statistics
+pub fn cmd_cache_stats(tracker: &Tracker) -> Result<()> {
+    let analyzer = Analyzer::new(tracker.clone());
+    let stats = analyzer.get_cache_stats()?;
+    println!("{}", stats);
+    Ok(())
+}
+
+// ============== REBUILD CACHE COMMAND ==============
+// NEW: Force rebuild of all caches
+pub fn cmd_rebuild_cache(tracker: &Tracker) -> Result<()> {
+    println!("Rebuilding caches...");
+    let analyzer = Analyzer::new(tracker.clone());
+    analyzer.rebuild_caches()?;
+    println!("Caches rebuilt successfully");
     Ok(())
 }
 

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fmt,
     path::PathBuf,
+    collections::HashMap,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -43,7 +44,7 @@ impl PackageSource {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Package {
     pub name: String,
     pub version: Option<String>,
@@ -60,6 +61,23 @@ pub struct Package {
     pub usage_count: Option<u64>,
     #[serde(default)]
     pub checksum: Option<String>,
+}
+
+// Custom equality: only name and source matter for identity
+impl PartialEq for Package {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.source == other.source
+    }
+}
+
+impl Eq for Package {}
+
+// Custom hash: only hash name and source
+impl std::hash::Hash for Package {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.source.hash(state);
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -125,21 +143,138 @@ pub struct PackageInfo {
     pub checksum: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Config {
-    pub log_file: PathBuf,
-    pub db_file: PathBuf,
-    pub cache_dir: PathBuf,
-    pub scan_dirs: Vec<PathBuf>,
-    pub exclude_patterns: Vec<String>,
-    pub auto_scan: bool,
-    pub scan_interval: u64,
-    pub max_log_size: u64,
-    pub log_level: String,
-    pub dependency_depth: usize,
-    pub protect_core: bool,
-    pub backup_before_remove: bool,
-    pub parallel_scans: usize,
+// ============= NEW CACHE STRUCTURES =============
+
+/// Cached dependency information to avoid repeated pkg show calls
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DependencyCache {
+    /// Direct dependencies for each package: package_name -> [dependencies]
+    pub direct_deps: HashMap<String, Vec<String>>,
+    /// Reverse dependencies: package_name -> [packages that depend on it]
+    pub reverse_deps: HashMap<String, Vec<String>>,
+    /// When this cache was built
+    pub built_at: i64,
+    /// How many packages were in the system when built
+    pub package_count: usize,
+    /// Maximum depth of dependency tree
+    pub max_depth: usize,
+}
+
+impl DependencyCache {
+    pub fn new() -> Self {
+        Self {
+            direct_deps: HashMap::new(),
+            reverse_deps: HashMap::new(),
+            built_at: 0,
+            package_count: 0,
+            max_depth: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.direct_deps.is_empty()
+    }
+
+    pub fn get_deps(&self, package: &str) -> Option<&Vec<String>> {
+        self.direct_deps.get(package)
+    }
+
+    pub fn get_reverse_deps(&self, package: &str) -> Option<&Vec<String>> {
+        self.reverse_deps.get(package)
+    }
+
+    pub fn has_package(&self, package: &str) -> bool {
+        self.direct_deps.contains_key(package)
+    }
+}
+
+/// Cached usage events to avoid scanning the log file repeatedly
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UsageCache {
+    /// All events in chronological order
+    pub events: Vec<PackageEvent>,
+    /// Index of events by package name: package_name -> [event indices]
+    pub package_index: HashMap<String, Vec<usize>>,
+    /// When this cache was loaded
+    pub loaded_at: i64,
+    /// Last event timestamp in the cache
+    pub last_event_timestamp: i64,
+    /// Total number of events
+    pub event_count: usize,
+}
+
+impl UsageCache {
+    pub fn new() -> Self {
+        Self {
+            events: Vec::new(),
+            package_index: HashMap::new(),
+            loaded_at: 0,
+            last_event_timestamp: 0,
+            event_count: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn get_events_for_package(&self, package: &str) -> Vec<&PackageEvent> {
+        if let Some(indices) = self.package_index.get(package) {
+            indices
+                .iter()
+                .filter_map(|&idx| self.events.get(idx))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn get_last_use(&self, package: &str) -> Option<i64> {
+        if let Some(indices) = self.package_index.get(package) {
+            indices
+                .iter()
+                .filter_map(|&idx| self.events.get(idx))
+                .filter(|e| e.action == "USE" || e.action == "INSTALL")
+                .max_by_key(|e| e.timestamp)
+                .map(|e| e.timestamp)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_usage_count(&self, package: &str) -> usize {
+        if let Some(indices) = self.package_index.get(package) {
+            indices
+                .iter()
+                .filter_map(|&idx| self.events.get(idx))
+                .filter(|e| e.action == "USE" || e.action == "INSTALL")
+                .count()
+        } else {
+            0
+        }
+    }
+
+    pub fn get_used_packages(&self) -> std::collections::HashSet<String> {
+        let mut used = std::collections::HashSet::new();
+        for event in &self.events {
+            if event.action == "INSTALL" || event.action == "USE" {
+                used.insert(event.package.clone());
+            }
+        }
+        used
+    }
+
+    pub fn get_install_time(&self, package: &str) -> Option<i64> {
+        if let Some(indices) = self.package_index.get(package) {
+            indices
+                .iter()
+                .filter_map(|&idx| self.events.get(idx))
+                .find(|e| e.action == "INSTALL")
+                .map(|e| e.timestamp)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

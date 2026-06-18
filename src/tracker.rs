@@ -4,18 +4,17 @@ use parking_lot::RwLock;
 use serde_json;
 use std::{
     collections::{HashMap, HashSet},
-    fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, BufRead},
+    fs::File,
+    io::{BufReader, BufRead},
     path::PathBuf,
     process::Command,
     sync::Arc,
-};    
+};
 
 use crate::{
     config::Config,
     models::*,
     scanner::PackageScanner,
-    utils,
     cache::CacheManager,
     logger::Logger,
 };
@@ -24,8 +23,13 @@ use crate::{
 pub struct Tracker {
     config: Arc<Config>,
     cache: Arc<RwLock<HashMap<String, Package>>>,
-    cache_manager: CacheManager,
+    pub cache_manager: CacheManager,
     logger: Logger,
+    // Performance caches
+    dependency_cache: Arc<RwLock<DependencyCache>>,
+    usage_cache: Arc<RwLock<UsageCache>>,
+    // Track when caches were last rebuilt
+    last_rebuild: Arc<RwLock<i64>>,
 }
 
 impl Tracker {
@@ -39,14 +43,20 @@ impl Tracker {
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_manager,
             logger,
+            dependency_cache: Arc::new(RwLock::new(DependencyCache::new())),
+            usage_cache: Arc::new(RwLock::new(UsageCache::new())),
+            last_rebuild: Arc::new(RwLock::new(0)),
         };
         
         tracker.load_cache()?;
+        tracker.rebuild_caches()?; // Build initial caches
+        
         Ok(tracker)
     }
 
+    // ============ CACHE MANAGEMENT ============
+
     fn load_cache(&self) -> Result<()> {
-        self.cache_manager.load()?;
         let packages = self.cache_manager.get_all();
         let mut cache = self.cache.write();
         cache.clear();
@@ -62,21 +72,253 @@ impl Tracker {
         Ok(())
     }
 
-    pub fn log_event(&self, event: &PackageEvent) -> Result<()> {
-        self.logger.log_event(event)
+    /// Rebuild all performance caches
+    pub fn rebuild_caches(&self) -> Result<()> {
+        let start = std::time::Instant::now();
+        
+        // Load usage cache from log file
+        let usage_cache = self.build_usage_cache()?;
+        *self.usage_cache.write() = usage_cache;
+        
+        // Build dependency cache
+        let dep_cache = self.build_dependency_cache()?;
+        *self.dependency_cache.write() = dep_cache;
+        
+        // Update rebuild timestamp
+        *self.last_rebuild.write() = Utc::now().timestamp();
+        
+        let duration = start.elapsed();
+        self.logger.info(&format!("Caches rebuilt in {:?}", duration))?;
+        
+        Ok(())
     }
 
-// This function runs really and I'm looking for ways to optimize it.
-// It's being called from the mod cmd commands in about five places. We'll need a cache for somethings.
-    pub fn get_installed_packages_all(&self) -> Result<Vec<Package>> {
-    // We call scanner and pass the tracker-config we received from the cmd - which came from main - there.
-        let packages = PackageScanner::scan_all(self.config.clone())?;
-        Ok(packages.into_iter().collect())
+    fn build_usage_cache(&self) -> Result<UsageCache> {
+        let mut cache = UsageCache::new();
+        
+        if !self.config.log_file.exists() {
+            return Ok(cache);
+        }
+
+        let file = File::open(&self.config.log_file)?;
+        let reader = BufReader::new(file);
+        let mut events = Vec::new();
+        let mut package_index: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut last_timestamp = 0;
+
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if let Ok(event) = serde_json::from_str::<PackageEvent>(&line) {
+                    let idx = events.len();
+                    events.push(event.clone());
+                    package_index.entry(event.package.clone()).or_default().push(idx);
+                    if event.timestamp > last_timestamp {
+                        last_timestamp = event.timestamp;
+                    }
+                }
+            }
+        }
+
+        cache.events = events;
+        cache.package_index = package_index;
+        cache.loaded_at = Utc::now().timestamp();
+        cache.last_event_timestamp = last_timestamp;
+        cache.event_count = cache.events.len();
+
+        Ok(cache)
     }
+
+    /// Build dependency cache using BATCH pkg show - ONE subprocess call for ALL packages
+    fn build_dependency_cache(&self) -> Result<DependencyCache> {
+        use indicatif::{ProgressBar, ProgressStyle};
+        
+        let packages = self.get_installed_packages_all()?;
+        let mut cache = DependencyCache::new();
+        
+        if packages.is_empty() {
+            return Ok(cache);
+        }
+
+        // Create progress bar
+        let pb = ProgressBar::new(packages.len() as u64);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} packages ({eta})")
+            .unwrap()
+            .progress_chars("#>-"));
+        
+        pb.set_message("Fetching dependencies");
+
+        // Get all package names for batch query
+        let pkg_names: Vec<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+        
+        // ONE subprocess call for ALL packages
+        let deps_map = self.get_dependencies_batch(&pkg_names)?;
+        
+        // Build cache from batch results
+        for (i, pkg) in packages.iter().enumerate() {
+            pb.inc(1);
+            
+            let deps = deps_map.get(&pkg.name).cloned().unwrap_or_default();
+            cache.direct_deps.insert(pkg.name.clone(), deps.clone());
+            
+            // Build reverse dependencies
+            for dep in deps {
+                cache.reverse_deps
+                    .entry(dep)
+                    .or_insert_with(Vec::new)
+                    .push(pkg.name.clone());
+            }
+        }
+
+        pb.finish_with_message("Dependencies cached");
+
+        cache.built_at = Utc::now().timestamp();
+        cache.package_count = packages.len();
+        cache.max_depth = 0; // Skip depth calc for speed (can be calculated on demand)
+        
+        Ok(cache)
+    }
+
+    /// Batch get dependencies for multiple packages in ONE subprocess call
+    fn get_dependencies_batch(&self, packages: &[&str]) -> Result<HashMap<String, Vec<String>>> {
+        if packages.is_empty() {
+            return Ok(HashMap::new());
+        }
+        
+        // Build command: pkg show pkg1 pkg2 pkg3 ...
+        let mut cmd = Command::new("pkg");
+        cmd.arg("show");
+        for pkg in packages {
+            cmd.arg(pkg);
+        }
+        
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                // Fallback: process one by one if batch fails
+                self.logger.warning(&format!("Batch pkg show failed, falling back to individual: {}", e))?;
+                return self.get_dependencies_batch_fallback(packages);
+            }
+        };
+        
+        if !output.status.success() {
+            // Fallback: process one by one if batch fails
+            self.logger.warning("Batch pkg show returned non-zero, falling back to individual")?;
+            return self.get_dependencies_batch_fallback(packages);
+        }
+        
+        let stdout = String::from_utf8(output.stdout)?;
+        let mut results = HashMap::new();
+        let mut current_pkg: Option<String> = None;
+        let mut current_deps: Vec<String> = Vec::new();
+        let mut in_deps = false;
+        
+        for line in stdout.lines() {
+            // Package header line: "Package: pkgname"
+            if line.starts_with("Package:") {
+                // Save previous package
+                if let Some(name) = current_pkg.take() {
+                    results.insert(name, current_deps.clone());
+                    current_deps.clear();
+                }
+                // Start new package
+                let name = line.trim_start_matches("Package:").trim().to_string();
+                current_pkg = Some(name);
+                in_deps = false;
+            } else if line.starts_with("Depends:") {
+                in_deps = true;
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() > 1 {
+                    let dep_list = parts[1].trim();
+                    for dep in dep_list.split(',') {
+                        let clean = dep.trim().split_whitespace().next().unwrap_or("").to_string();
+                        if !clean.is_empty() {
+                            current_deps.push(clean);
+                        }
+                    }
+                }
+            } else if in_deps && line.starts_with(' ') {
+                for dep in line.trim().split(',') {
+                    let clean = dep.trim().split_whitespace().next().unwrap_or("").to_string();
+                    if !clean.is_empty() {
+                        current_deps.push(clean);
+                    }
+                }
+            } else if in_deps && !line.starts_with(' ') && !line.is_empty() {
+                in_deps = false;
+            }
+        }
+        
+        // Save last package
+        if let Some(name) = current_pkg {
+            results.insert(name, current_deps);
+        }
+        
+        Ok(results)
+    }
+
+    /// Fallback: process one by one if batch fails
+    fn get_dependencies_batch_fallback(&self, packages: &[&str]) -> Result<HashMap<String, Vec<String>>> {
+        use indicatif::{ProgressBar, ProgressStyle};
+        
+        let pb = ProgressBar::new(packages.len() as u64);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.yellow} [{elapsed_precise}] [{bar:40.yellow/blue}] {pos}/{len} packages (fallback)")
+            .unwrap()
+            .progress_chars("#>-"));
+        
+        pb.set_message("Fetching dependencies (individual fallback)");
+        
+        let mut results = HashMap::new();
+        for pkg in packages {
+            pb.inc(1);
+            if let Ok(deps) = self.get_dependencies_from_system_safe(pkg) {
+                results.insert(pkg.to_string(), deps);
+            }
+        }
+        
+        pb.finish_with_message("Fallback complete");
+        Ok(results)
+    }
+
+    /// Safe version that returns empty vec on error instead of failing
+    fn get_dependencies_from_system_safe(&self, package: &str) -> Result<Vec<String>> {
+        match self.get_dependencies_from_system(package) {
+            Ok(deps) => Ok(deps),
+            Err(e) => {
+                // Log warning but continue with empty deps
+                let _ = self.logger.warning(&format!("Failed to get deps for {}: {}", package, e));
+                Ok(Vec::new()) // Return empty deps instead of error
+            }
+        }
+    }
+
+    fn calculate_depth(&self, package: &str, deps: &HashMap<String, Vec<String>>, current_depth: usize, visited: &mut HashSet<String>) -> usize {
+        if visited.contains(package) {
+            return current_depth;
+        }
+        visited.insert(package.to_string());
+
+        if let Some(dep_list) = deps.get(package) {
+            let mut max_child_depth = current_depth;
+            for dep in dep_list {
+                let child_depth = self.calculate_depth(dep, deps, current_depth + 1, visited);
+                if child_depth > max_child_depth {
+                    max_child_depth = child_depth;
+                }
+            }
+            max_child_depth
+        } else {
+            current_depth
+        }
+    }
+
+    // ============ PACKAGE SCANNING ============
 
     pub fn scan_all_packages(&self, force: bool) -> Result<Vec<Package>> {
         if !force && self.cache_manager.is_fresh()? {
-            return self.get_installed_packages_all();
+            // Return cached packages without rescanning
+            return Ok(self.cache.read().values().cloned().collect());
         }
 
         self.logger.info("Starting package scan")?;
@@ -92,11 +334,48 @@ impl Tracker {
         }
         drop(cache);
 
+        // Rebuild caches after scan
+        self.rebuild_caches()?;
+
         self.logger.info(&format!("Scan complete: {} packages found", packages_vec.len()))?;
         Ok(packages_vec)
     }
 
+    pub fn get_installed_packages_all(&self) -> Result<Vec<Package>> {
+        // Try cache first
+        let cache = self.cache.read();
+        if !cache.is_empty() {
+            return Ok(cache.values().cloned().collect());
+        }
+        drop(cache);
+        
+        // Fallback to scan
+        self.scan_all_packages(false)
+    }
+
+    // ============ DEPENDENCY RESOLUTION (CACHED) ============
+
+    /// Get dependencies for a package - uses cache when possible
     pub fn get_dependencies(&self, package: &str) -> Result<Vec<String>> {
+        // Check cache first
+        let dep_cache = self.dependency_cache.read();
+        if let Some(deps) = dep_cache.get_deps(package) {
+            return Ok(deps.clone());
+        }
+        drop(dep_cache);
+
+        // Fallback to system query (safe version)
+        let deps = self.get_dependencies_from_system_safe(package)?;
+        
+        // Update cache
+        let mut dep_cache = self.dependency_cache.write();
+        dep_cache.direct_deps.insert(package.to_string(), deps.clone());
+        drop(dep_cache);
+        
+        Ok(deps)
+    }
+
+    fn get_dependencies_from_system(&self, package: &str) -> Result<Vec<String>> {
         let output = Command::new("pkg")
             .arg("show")
             .arg(package)
@@ -144,50 +423,15 @@ impl Tracker {
         Ok(deps)
     }
 
-    pub fn get_all_dependencies(&self, packages: &[String]) -> Result<HashSet<String>> {
-        let mut all_deps = HashSet::new();
-        let mut to_process: Vec<String> = packages.to_vec();
-        let mut processed = HashSet::new();
-        let core_packages = Self::get_core_packages();
-
-        let depth_limit = self.config.dependency_depth;
-        let mut depth_map: HashMap<String, usize> = HashMap::new();
-
-        for pkg in packages {
-            depth_map.insert(pkg.clone(), 0);
-        }
-
-        while let Some(pkg) = to_process.pop() {
-            if processed.contains(&pkg) {
-                continue;
-            }
-
-            let current_depth = *depth_map.get(&pkg).unwrap_or(&0);
-            if current_depth >= depth_limit {
-                continue;
-            }
-
-            processed.insert(pkg.clone());
-
-            if core_packages.contains(&pkg.as_str()) {
-                continue;
-            }
-
-            if let Ok(deps) = self.get_dependencies(&pkg) {
-                for dep in deps {
-                    if !processed.contains(&dep) && !all_deps.contains(&dep) {
-                        all_deps.insert(dep.clone());
-                        to_process.push(dep.clone());
-                        depth_map.insert(dep, current_depth + 1);
-                    }
-                }
-            }
-        }
-
-        Ok(all_deps)
-    }
-
+    /// Get reverse dependencies - uses cache when possible
     pub fn get_reverse_dependencies(&self, package: &str) -> Result<Vec<String>> {
+        let dep_cache = self.dependency_cache.read();
+        if let Some(reverse) = dep_cache.get_reverse_deps(package) {
+            return Ok(reverse.clone());
+        }
+        drop(dep_cache);
+
+        // Fallback: expensive O(n²) scan - but this should rarely happen
         let all_packages = self.get_installed_packages_all()?;
         let mut reverse_deps = Vec::new();
 
@@ -199,12 +443,57 @@ impl Tracker {
             }
         }
 
+        // Cache the result
+        let mut dep_cache = self.dependency_cache.write();
+        dep_cache.reverse_deps.insert(package.to_string(), reverse_deps.clone());
+        drop(dep_cache);
+
         Ok(reverse_deps)
     }
 
-    pub fn get_used_packages(&self) -> Result<HashSet<String>> {
-        let mut used = HashSet::new();
+    /// Get all dependencies recursively for a set of packages
+    pub fn get_all_dependencies(&self, packages: &[String]) -> Result<HashSet<String>> {
+        let mut all_deps = HashSet::new();
+        let mut to_process: Vec<String> = packages.to_vec();
+        let mut processed = HashSet::new();
+        let core_packages = Self::get_core_packages();
+        let _depth_limit = self.config.dependency_depth;
 
+        while let Some(pkg) = to_process.pop() {
+            if processed.contains(&pkg) {
+                continue;
+            }
+            processed.insert(pkg.clone());
+
+            if core_packages.contains(&pkg.as_str()) {
+                continue;
+            }
+
+            if let Ok(deps) = self.get_dependencies(&pkg) {
+                for dep in deps {
+                    if !processed.contains(&dep) && !all_deps.contains(&dep) {
+                        all_deps.insert(dep.clone());
+                        to_process.push(dep);
+                    }
+                }
+            }
+        }
+
+        Ok(all_deps)
+    }
+
+    // ============ USAGE TRACKING (CACHED) ============
+
+    /// Get all used packages - uses cache
+    pub fn get_used_packages(&self) -> Result<HashSet<String>> {
+        let usage_cache = self.usage_cache.read();
+        if !usage_cache.is_empty() {
+            return Ok(usage_cache.get_used_packages());
+        }
+        drop(usage_cache);
+
+        // Fallback: scan log file
+        let mut used = HashSet::new();
         if self.config.log_file.exists() {
             let file = File::open(&self.config.log_file)?;
             let reader = BufReader::new(file);
@@ -219,40 +508,70 @@ impl Tracker {
                 }
             }
         }
-
         Ok(used)
     }
 
-    pub fn get_core_packages() -> HashSet<&'static str> {
-        let mut core = HashSet::new();
-        core.insert("bash");
-        core.insert("coreutils");
-        core.insert("findutils");
-        core.insert("grep");
-        core.insert("sed");
-        core.insert("awk");
-        core.insert("tar");
-        core.insert("gzip");
-        core.insert("xz-utils");
-        core.insert("termux-tools");
-        core.insert("termux-exec");
-        core.insert("termux-keyring");
-        core.insert("termux-am");
-        core.insert("termux-api");
-        core.insert("apk-tools");
-        core.insert("apt");
-        core.insert("dpkg");
-        core.insert("busybox");
-        core.insert("ca-certificates");
-        core.insert("openssl");
-        core.insert("libc++");
-        core.insert("libandroid-support");
-        core.insert("libc++_shared");
-        core.insert("zlib");
-        core.insert("ncurses");
-        core.insert("readline");
-        core
+    fn get_install_date_from_cache(&self, package: &str) -> Option<String> {
+        let usage_cache = self.usage_cache.read();
+        if let Some(timestamp) = usage_cache.get_install_time(package) {
+            let dt = DateTime::<Local>::from(Utc.timestamp_opt(timestamp, 0).unwrap());
+            return Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+        }
+        None
     }
+
+    fn get_last_used_date_from_cache(&self, package: &str) -> Option<String> {
+        let usage_cache = self.usage_cache.read();
+        if let Some(timestamp) = usage_cache.get_last_use(package) {
+            let dt = DateTime::<Local>::from(Utc.timestamp_opt(timestamp, 0).unwrap());
+            return Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+        }
+        None
+    }
+
+    fn get_usage_count_from_cache(&self, package: &str) -> Option<u64> {
+        let usage_cache = self.usage_cache.read();
+        let count = usage_cache.get_usage_count(package);
+        if count > 0 {
+            Some(count as u64)
+        } else {
+            None
+        }
+    }
+
+    // ============ PACKAGE INFORMATION ============
+
+    pub fn get_package_info(&self, package: &str) -> Result<PackageInfo> {
+        let installed = self.get_installed_packages_all()?;
+        let pkg = installed
+            .iter()
+            .find(|p| p.name == package)
+            .ok_or_else(|| anyhow!("Package '{}' not found", package))?
+            .clone();
+
+        let dependencies = self.get_dependencies(package).ok();
+        let reverse_deps = self.get_reverse_dependencies(package).ok();
+
+        let installed_date = self.get_install_date_from_cache(package);
+        let last_used_date = self.get_last_used_date_from_cache(package);
+        let usage_count = self.get_usage_count_from_cache(package);
+
+        Ok(PackageInfo {
+            name: pkg.name,
+            version: pkg.version,
+            source: pkg.source,
+            install_path: pkg.install_path,
+            size: pkg.size,
+            installed_date,
+            last_used_date,
+            dependencies,
+            reverse_dependencies: reverse_deps,
+            usage_count,
+            checksum: pkg.checksum,
+        })
+    }
+
+    // ============ FINDING UNUSED PACKAGES ============
 
     pub fn find_unused(&self, days_threshold: u32) -> Result<Vec<UnusedPackage>> {
         let installed = self.get_installed_packages_all()?;
@@ -260,21 +579,8 @@ impl Tracker {
         let current_time = Utc::now().timestamp();
         let threshold_seconds = (days_threshold as i64) * 86400;
 
-        let mut events = Vec::new();
-        if self.config.log_file.exists() {
-            let file = File::open(&self.config.log_file)?;
-            let reader = BufReader::new(file);
-
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    if let Ok(event) = serde_json::from_str::<PackageEvent>(&line) {
-                        events.push(event);
-                    }
-                }
-            }
-        }
-
-        let used_packages = self.get_used_packages()?;
+        let usage_cache = self.usage_cache.read();
+        let used_packages = usage_cache.get_used_packages();
         let mut unused = Vec::new();
 
         for pkg in installed {
@@ -286,16 +592,7 @@ impl Tracker {
                 continue;
             }
 
-            let entries: Vec<_> = events
-                .iter()
-                .filter(|e| e.package == pkg.name)
-                .collect();
-
-            let last_used = entries
-                .iter()
-                .max_by_key(|e| e.timestamp)
-                .map(|e| e.timestamp);
-
+            let last_used = usage_cache.get_last_use(&pkg.name);
             let days_unused = if let Some(last) = last_used {
                 let age = current_time - last;
                 if age > threshold_seconds {
@@ -304,7 +601,12 @@ impl Tracker {
                     continue;
                 }
             } else {
-                0
+                // Never used - count as unused if threshold is 0 or package is old
+                if days_threshold == 0 {
+                    0
+                } else {
+                    continue;
+                }
             };
 
             unused.push(UnusedPackage {
@@ -322,7 +624,7 @@ impl Tracker {
     }
 
     pub fn find_unused_with_deps(&self, days_threshold: u32) -> Result<Vec<UnusedPackage>> {
-        let mut unused = self.find_unused(days_threshold)?;
+        let unused = self.find_unused(days_threshold)?;
         let used_packages = self.get_used_packages()?;
         let used_vec: Vec<String> = used_packages.into_iter().collect();
         let dependency_set = self.get_all_dependencies(&used_vec)?;
@@ -371,106 +673,7 @@ impl Tracker {
         Ok(format!("Package '{}' is not protected", package))
     }
 
-    pub fn get_package_info(&self, package: &str) -> Result<PackageInfo> {
-        let installed = self.get_installed_packages_all()?;
-        let pkg = installed
-            .iter()
-            .find(|p| p.name == package)
-            .ok_or_else(|| anyhow!("Package '{}' not found", package))?
-            .clone();
-
-        let dependencies = self.get_dependencies(package).ok();
-        let reverse_deps = self.get_reverse_dependencies(package).ok();
-
-        let installed_date = self.get_install_date(package);
-        let last_used_date = self.get_last_used_date(package);
-        let usage_count = self.get_usage_count(package);
-
-        Ok(PackageInfo {
-            name: pkg.name,
-            version: pkg.version,
-            source: pkg.source,
-            install_path: pkg.install_path,
-            size: pkg.size,
-            installed_date,
-            last_used_date,
-            dependencies,
-            reverse_dependencies: reverse_deps,
-            usage_count,
-            checksum: pkg.checksum,
-        })
-    }
-
-    fn get_install_date(&self, package: &str) -> Option<String> {
-        if !self.config.log_file.exists() {
-            return None;
-        }
-
-        let file = File::open(&self.config.log_file).ok()?;
-        let reader = BufReader::new(file);
-
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                if let Ok(event) = serde_json::from_str::<PackageEvent>(&line) {
-                    if event.package == package && event.action == "INSTALL" {
-                        let dt = DateTime::<Local>::from(Utc.timestamp_opt(event.timestamp, 0).unwrap());
-                        return Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    fn get_last_used_date(&self, package: &str) -> Option<String> {
-        if !self.config.log_file.exists() {
-            return None;
-        }
-
-        let file = File::open(&self.config.log_file).ok()?;
-        let reader = BufReader::new(file);
-
-        let mut last_ts = None;
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                if let Ok(event) = serde_json::from_str::<PackageEvent>(&line) {
-                    if event.package == package && (event.action == "USE" || event.action == "INSTALL") {
-                        if last_ts.is_none() || event.timestamp > last_ts.unwrap() {
-                            last_ts = Some(event.timestamp);
-                        }
-                    }
-                }
-            }
-        }
-
-        last_ts.map(|ts| {
-            let dt = DateTime::<Local>::from(Utc.timestamp_opt(ts, 0).unwrap());
-            dt.format("%Y-%m-%d %H:%M:%S").to_string()
-        })
-    }
-
-    fn get_usage_count(&self, package: &str) -> Option<u64> {
-        if !self.config.log_file.exists() {
-            return None;
-        }
-
-        let file = File::open(&self.config.log_file).ok()?;
-        let reader = BufReader::new(file);
-
-        let mut count = 0;
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                if let Ok(event) = serde_json::from_str::<PackageEvent>(&line) {
-                    if event.package == package && (event.action == "USE" || event.action == "INSTALL") {
-                        count += 1;
-                    }
-                }
-            }
-        }
-
-        Some(count)
-    }
+    // ============ PACKAGE MANAGEMENT ============
 
     pub fn remove_package(&self, unused_pkg: &UnusedPackage) -> Result<()> {
         if self.config.backup_before_remove {
@@ -499,6 +702,9 @@ impl Tracker {
                     cache.remove(&unused_pkg.name);
                     drop(cache);
                     self.save_cache()?;
+                    
+                    // Rebuild caches after removal
+                    self.rebuild_caches()?;
 
                     self.logger.info(&format!("Removed package: {}", unused_pkg.name))?;
                     Ok(())
@@ -530,6 +736,9 @@ impl Tracker {
                 cache.remove(&unused_pkg.name);
                 drop(cache);
                 self.save_cache()?;
+                
+                // Rebuild caches after removal
+                self.rebuild_caches()?;
 
                 self.logger.info(&format!("Removed package: {}", unused_pkg.name))?;
                 Ok(())
@@ -537,31 +746,44 @@ impl Tracker {
         }
     }
 
-    fn backup_package(&self, pkg: &UnusedPackage) -> Result<()> {
-        let backup_dir = self.config.cache_dir.join("backups");
-        std::fs::create_dir_all(&backup_dir)?;
-
-        let timestamp = Utc::now().timestamp();
-        let backup_path = backup_dir.join(format!("{}_{}", pkg.name, timestamp));
-
-        if pkg.install_path.exists() {
-            if pkg.install_path.is_dir() {
-                let output = Command::new("cp")
-                    .arg("-r")
-                    .arg(&pkg.install_path)
-                    .arg(&backup_path)
+    pub fn install_package(&self, package: &Package) -> Result<()> {
+        match package.source {
+            PackageSource::Pkg => {
+                let output = Command::new("pkg")
+                    .arg("install")
+                    .arg(&package.name)
                     .output()?;
 
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    self.logger.warning(&format!("Backup failed for {}: {}", pkg.name, stderr))?;
+                if output.status.success() {
+                    self.log_event(&PackageEvent {
+                        timestamp: Utc::now().timestamp(),
+                        package: package.name.clone(),
+                        action: "INSTALL".to_string(),
+                        source: PackageSource::Pkg,
+                        details: None,
+                        pid: None,
+                        user: None,
+                    })?;
+
+                    let mut cache = self.cache.write();
+                    cache.insert(package.name.clone(), package.clone());
+                    drop(cache);
+                    self.save_cache()?;
+                    
+                    // Rebuild caches after installation
+                    self.rebuild_caches()?;
+
+                    self.logger.info(&format!("Installed package: {}", package.name))?;
+                    Ok(())
                 } else {
-                    self.logger.info(&format!("Backed up {} to {}", pkg.name, backup_path.display()))?;
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(anyhow!("Failed to install package: {}", stderr))
                 }
             }
+            _ => {
+                Err(anyhow!("Cannot automatically install {} packages", package.source))
+            }
         }
-
-        Ok(())
     }
 
     pub fn remove_package_from_cache(&self, package: &str) -> Result<()> {
@@ -569,6 +791,7 @@ impl Tracker {
         cache.remove(package);
         drop(cache);
         self.save_cache()?;
+        self.rebuild_caches()?;
         self.logger.info(&format!("Removed {} from cache", package))?;
         Ok(())
     }
@@ -603,8 +826,7 @@ impl Tracker {
                 visited.insert(dep.clone());
                 if let Ok(sub_deps) = self.get_dependencies(dep) {
                     if !sub_deps.is_empty() {
-                        let new_indent = if is_last { indent + 1 } else { indent + 1 };
-                        self.print_tree(dep, &sub_deps, new_indent, max_depth, visited)?;
+                        self.print_tree_with_vertical(dep, &sub_deps, indent + 1, max_depth, visited, is_last)?;
                     }
                 }
                 visited.remove(dep);
@@ -614,42 +836,36 @@ impl Tracker {
         Ok(())
     }
 
-    pub fn install_package(&self, package: &Package) -> Result<()> {
-        match package.source {
-            PackageSource::Pkg => {
-                let output = Command::new("pkg")
-                    .arg("install")
-                    .arg(&package.name)
-                    .output()?;
+    fn print_tree_with_vertical(&self, _package: &str, deps: &[String], indent: usize, max_depth: usize, visited: &mut HashSet<String>, parent_is_last: bool) -> Result<()> {
+        if indent >= max_depth {
+            println!("{}... (depth limit reached)", "  ".repeat(indent));
+            return Ok(());
+        }
 
-                if output.status.success() {
-                    self.log_event(&PackageEvent {
-                        timestamp: Utc::now().timestamp(),
-                        package: package.name.clone(),
-                        action: "INSTALL".to_string(),
-                        source: PackageSource::Pkg,
-                        details: None,
-                        pid: None,
-                        user: None,
-                    })?;
-
-                    let mut cache = self.cache.write();
-                    cache.insert(package.name.clone(), package.clone());
-                    drop(cache);
-                    self.save_cache()?;
-
-                    self.logger.info(&format!("Installed package: {}", package.name))?;
-                    Ok(())
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    Err(anyhow!("Failed to install package: {}", stderr))
+        let prefix = if parent_is_last { "    " } else { "│   " };
+        let full_prefix = "  ".repeat(indent) + prefix;
+        
+        for (i, dep) in deps.iter().enumerate() {
+            let is_last = i == deps.len() - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+            let status = if visited.contains(dep) { " [cycle]" } else { "" };
+            
+            println!("{}{}{}{}", full_prefix, connector, dep, status);
+            
+            if !visited.contains(dep) {
+                visited.insert(dep.clone());
+                if let Ok(sub_deps) = self.get_dependencies(dep) {
+                    if !sub_deps.is_empty() {
+                        self.print_tree_with_vertical(dep, &sub_deps, indent + 1, max_depth, visited, is_last)?;
+                    }
                 }
-            }
-            _ => {
-                Err(anyhow!("Cannot automatically install {} packages", package.source))
+                visited.remove(dep);
             }
         }
+        Ok(())
     }
+
+    // ============ STATISTICS ============
 
     pub fn get_stats(&self) -> Result<Stats> {
         let packages = self.get_installed_packages_all()?;
@@ -686,27 +902,13 @@ impl Tracker {
             0
         };
 
-        let mut log_entries = 0;
-        let mut install_events = 0;
-        let mut remove_events = 0;
-
-        if self.config.log_file.exists() {
-            let file = File::open(&self.config.log_file)?;
-            let reader = BufReader::new(file);
-
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    log_entries += 1;
-                    if let Ok(event) = serde_json::from_str::<PackageEvent>(&line) {
-                        if event.action == "INSTALL" {
-                            install_events += 1;
-                        } else if event.action == "REMOVE" {
-                            remove_events += 1;
-                        }
-                    }
-                }
-            }
-        }
+        let usage_cache = self.usage_cache.read();
+        let total_install_events = usage_cache.events.iter()
+            .filter(|e| e.action == "INSTALL")
+            .count();
+        let total_remove_events = usage_cache.events.iter()
+            .filter(|e| e.action == "REMOVE")
+            .count();
 
         Ok(Stats {
             total_packages: packages.len(),
@@ -717,10 +919,74 @@ impl Tracker {
             oldest_packages,
             newest_packages,
             average_package_size: avg_size,
-            total_log_entries: log_entries,
-            total_install_events: install_events,
-            total_remove_events: remove_events,
+            total_log_entries: usage_cache.event_count,
+            total_install_events,
+            total_remove_events,
         })
+    }
+
+    // ============ UTILITY FUNCTIONS ============
+
+    pub fn log_event(&self, event: &PackageEvent) -> Result<()> {
+        self.logger.log_event(event)
+    }
+
+    fn backup_package(&self, pkg: &UnusedPackage) -> Result<()> {
+        let backup_dir = self.config.cache_dir.join("backups");
+        std::fs::create_dir_all(&backup_dir)?;
+
+        let timestamp = Utc::now().timestamp();
+        let backup_path = backup_dir.join(format!("{}_{}", pkg.name, timestamp));
+
+        if pkg.install_path.exists() {
+            if pkg.install_path.is_dir() {
+                let output = Command::new("cp")
+                    .arg("-r")
+                    .arg(&pkg.install_path)
+                    .arg(&backup_path)
+                    .output()?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    self.logger.warning(&format!("Backup failed for {}: {}", pkg.name, stderr))?;
+                } else {
+                    self.logger.info(&format!("Backed up {} to {}", pkg.name, backup_path.display()))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn get_core_packages() -> HashSet<&'static str> {
+        let mut core = HashSet::new();
+        core.insert("bash");
+        core.insert("coreutils");
+        core.insert("findutils");
+        core.insert("grep");
+        core.insert("sed");
+        core.insert("awk");
+        core.insert("tar");
+        core.insert("gzip");
+        core.insert("xz-utils");
+        core.insert("termux-tools");
+        core.insert("termux-exec");
+        core.insert("termux-keyring");
+        core.insert("termux-am");
+        core.insert("termux-api");
+        core.insert("apk-tools");
+        core.insert("apt");
+        core.insert("dpkg");
+        core.insert("busybox");
+        core.insert("ca-certificates");
+        core.insert("openssl");
+        core.insert("libc++");
+        core.insert("libandroid-support");
+        core.insert("libc++_shared");
+        core.insert("zlib");
+        core.insert("ncurses");
+        core.insert("readline");
+        core
     }
 
     pub fn get_tracker(&self) -> Tracker {
@@ -729,6 +995,14 @@ impl Tracker {
             cache: self.cache.clone(),
             cache_manager: self.cache_manager.clone(),
             logger: self.logger.clone(),
+            dependency_cache: self.dependency_cache.clone(),
+            usage_cache: self.usage_cache.clone(),
+            last_rebuild: self.last_rebuild.clone(),
         }
+    }
+
+    // Getter for cache_manager
+    pub fn get_cache_manager(&self) -> CacheManager {
+        self.cache_manager.clone()
     }
 }

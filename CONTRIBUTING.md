@@ -1,7 +1,7 @@
 
-# Contributing to termtrace
+# Contributing to pkgtrace
 
-Thank you for your interest in contributing to termtrace! This document provides guidelines and instructions for contributing to the project.
+Thank you for your interest in contributing to pkgtrace! This document provides guidelines and instructions for contributing to the project.
 
 ## Table of Contents
 Hang on guys! These jump-links are currently NOT working(on my device)! I guess Spectra will help me rewrite them 🤣.
@@ -45,7 +45,7 @@ This project adheres to a Code of Conduct that all contributors are expected to 
 1. **Fork the repository** on GitHub
 2. **Clone your fork**:
    ```bash
-   git clone https://github.com/your-username/termtrace.git && cd termtrace
+   git clone https://github.com/your-username/pkgtrace.git && cd pkgtrace
    ```
 
 3. Set up the development environment:
@@ -270,7 +270,7 @@ cargo tarpaulin
 
 1. Update your fork:
    ```bash
-   git remote add upstream https://github.com/oboobotenefiok/termtrace.git
+   git remote add upstream https://github.com/oboobotenefiok/pkgtrace.git
    git fetch upstream
    git rebase upstream/main
    ```
@@ -400,7 +400,7 @@ For CLI changes, update the man page:
 
 ```bash
 # Generate man page
-pandoc -s -t man README.md -o termtrace.1
+pandoc -s -t man README.md -o pkgtrace.1
 ```
 
 ### Release Process
@@ -453,7 +453,7 @@ If you're new to Rust or the project, don't hesitate to ask for help. We're happ
 
 ---
 
-Thank you for contributing to termtrace! Your efforts help make package management on Termux better for everyone.
+Thank you for contributing to pkgtrace! Your efforts help make package management on Termux better for everyone.
 
 Happy coding! 🦀
 

@@ -22,8 +22,8 @@ Cargo.lock
 *.iml
 
 # Build artifacts
-termtrace
-termtrace.exe
+pkgtrace
+pkgtrace.exe
 *.o
 *.so
 *.dylib

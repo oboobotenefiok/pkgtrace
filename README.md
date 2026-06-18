@@ -1,8 +1,8 @@
-# termtrace - Advanced Package Tracker for Termux
+# pkgtrace - Advanced Package Tracker for Termux
 
 # 👀
 
-termtrace is a comprehensive package management tool for Termux that tracks all installed packages across multiple package managers (pkg, cargo, pip, npm, gem, manual) with intelligent dependency resolution and unused package detection.
+pkgtrace is a comprehensive package management tool for Termux that tracks all installed packages across multiple package managers (pkg, cargo, pip, npm, gem, manual) with intelligent dependency resolution and unused package detection.
 
 ##### If you're here to figure out the Rust Programming Language, please start the tour from the main function in the main.rs file in the src folder. (/src/main.rs)
 
@@ -26,65 +26,65 @@ termtrace is a comprehensive package management tool for Termux that tracks all 
 ### Quick Install
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/termux/termtrace/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/termux/pkgtrace/main/install.sh | bash
 ```
 
 ### Manual Install
 
 ```bash
-git clone https://github.com/termux/termtrace
-cd termtrace
+git clone https://github.com/termux/pkgtrace
+cd pkgtrace
 cargo build --release
-cp target/release/termtrace /data/data/com.termux/files/usr/bin/
+cp target/release/pkgtrace /data/data/com.termux/files/usr/bin/
 ```
 
 ### From Package Manager (Future)
 
 ```bash
-pkg install termtrace
+pkg install pkgtrace
 ```
 
 ### Quick Start
 
 ```bash
 # Initial scan
-termtrace scan
+pkgtrace scan
 
 # List all installed packages
-termtrace list
+pkgtrace list
 
 # List packages with sizes
-termtrace list --sizes
+pkgtrace list --sizes
 
 # Find unused packages (30+ days)
-termtrace unused
+pkgtrace unused
 
 # Find unused with dependency protection
-termtrace unused --deps
+pkgtrace unused --deps
 
 # Show detailed explanations
-termtrace unused --explain --deps
+pkgtrace unused --explain --deps
 
 # Clean up unused packages interactively
-termtrace clean
+pkgtrace clean
 
 # Auto-clean without confirmation
-termtrace clean --yes
+pkgtrace clean --yes
 
 # Show package information
-termtrace info rust
+pkgtrace info rust
 
 # Show dependency tree
-termtrace deps rust --tree
+pkgtrace deps rust --tree
 
 # Show reverse dependencies
-termtrace deps clang --reverse
+pkgtrace deps clang --reverse
 
 # Export package list
-termtrace export --format json --output packages.json
+pkgtrace export --format json --output packages.json
 
 # Import package list
-termtrace import packages.json --dry-run
+pkgtrace import packages.json --dry-run
 ```
 
 ## Commands Reference
@@ -94,7 +94,7 @@ termtrace import packages.json --dry-run
 List all installed packages with filtering options.
 
 ```bash
-termtrace list [OPTIONS]
+pkgtrace list [OPTIONS]
 
 Options:
   -s, --sizes          Show package sizes
@@ -108,7 +108,7 @@ Options:
 Find packages that haven't been used for a specified number of days.
 
 ```bash
-termtrace unused [OPTIONS] [DAYS]
+pkgtrace unused [OPTIONS] [DAYS]
 
 Options:
   -e, --explain        Show why packages are protected
@@ -123,7 +123,7 @@ Options:
 Show package dependencies.
 
 ```bash
-termtrace deps PACKAGE [OPTIONS]
+pkgtrace deps PACKAGE [OPTIONS]
 
 Options:
   -r, --reverse       Show reverse dependencies
@@ -136,7 +136,7 @@ Options:
 Show detailed information about a package.
 
 ```bash
-termtrace info PACKAGE [OPTIONS]
+pkgtrace info PACKAGE [OPTIONS]
 
 Options:
   -v, --verbose       Show verbose information
@@ -147,7 +147,7 @@ Options:
 Scan for installed packages and update the database.
 
 ```bash
-termtrace scan [OPTIONS]
+pkgtrace scan [OPTIONS]
 
 Options:
   -f, --force         Force full rescan
@@ -159,7 +159,7 @@ Options:
 Interactive cleanup of unused packages.
 
 ```bash
-termtrace clean [OPTIONS]
+pkgtrace clean [OPTIONS]
 
 Options:
   -y, --yes           Auto-confirm removal
@@ -172,7 +172,7 @@ Options:
 Export package list to a file.
 
 ```bash
-termtrace export [OPTIONS]
+pkgtrace export [OPTIONS]
 
 Options:
   -f, --format FORMAT     Output format (json, csv, markdown, yaml)
@@ -185,7 +185,7 @@ Options:
 Import and install packages from a file.
 
 ```bash
-termtrace import FILE [OPTIONS]
+pkgtrace import FILE [OPTIONS]
 
 Options:
   -d, --dry-run       Show what would be installed without actually installing
@@ -197,7 +197,7 @@ Options:
 Generate detailed analysis report.
 
 ```bash
-termtrace analyze [DAYS] [OPTIONS]
+pkgtrace analyze [DAYS] [OPTIONS]
 
 Options:
   -o, --output FILE   Output report to file
@@ -208,7 +208,7 @@ Options:
 Generate dependency graph.
 
 ```bash
-termtrace graph PACKAGE [OPTIONS]
+pkgtrace graph PACKAGE [OPTIONS]
 
 Options:
   -f, --format FORMAT   Output format (dot, json)
@@ -220,7 +220,7 @@ Options:
 Remove only packages that are safe to remove.
 
 ```bash
-termtrace safe-remove [DAYS] [OPTIONS]
+pkgtrace safe-remove [DAYS] [OPTIONS]
 
 Options:
   -y, --yes           Auto-confirm removal
@@ -232,7 +232,7 @@ Options:
 Show package statistics.
 
 ```bash
-termtrace stats
+pkgtrace stats
 ```
 
 ### monitor
@@ -240,7 +240,7 @@ termtrace stats
 Monitor package usage.
 
 ```bash
-termtrace monitor [OPTIONS]
+pkgtrace monitor [OPTIONS]
 
 Options:
   -d, --daemon        Run as daemon
@@ -252,18 +252,18 @@ Options:
 Verify package integrity.
 
 ```bash
-termtrace verify [OPTIONS]
+pkgtrace verify [OPTIONS]
 
 Options:
   -f, --fix           Fix issues automatically
 ```
 
-### termtrace
+### pkgtrace
 
 Search for installed packages.
 
 ```bash
-termtrace search QUERY [OPTIONS]
+pkgtrace search QUERY [OPTIONS]
 
 Options:
   -S, --source SOURCE   Filter by source
@@ -274,7 +274,7 @@ Options:
 Remove unused dependency packages.
 
 ```bash
-termtrace autoremove [OPTIONS]
+pkgtrace autoremove [OPTIONS]
 
 Options:
   -y, --yes           Auto-confirm removal
@@ -284,12 +284,12 @@ Options:
 ## Configuration
 ###### Note that you don't have to handle this manually. This file is created automatically every time the program runs without it being found. This includes the first time the program is run.
 ###### Note that not all packages are being handled currently. The more reason we have to maintain this regular.
-Create ~/.config/termtrace/config.toml:
+Create ~/.config/pkgtrace/config.toml:
 
 ```toml
-log_file = "/data/data/com.termux/files/home/.config/termtrace/termtrace.log"
-db_file = "/data/data/com.termux/files/home/.config/termtrace/packages.db.json"
-cache_dir = "/data/data/com.termux/files/home/.config/termtrace/cache"
+log_file = "/data/data/com.termux/files/home/.config/pkgtrace/pkgtrace.log"
+db_file = "/data/data/com.termux/files/home/.config/pkgtrace/packages.db.json"
+cache_dir = "/data/data/com.termux/files/home/.config/pkgtrace/cache"
 auto_scan = true
 scan_interval = 86400
 max_log_size = 10485760
@@ -356,7 +356,7 @@ Finding and Removing Unused Packages
 
 ```bash
 # Find packages unused for 30+ days, protected by dependencies
-$ termtrace unused --deps --explain
+$ pkgtrace unused --deps --explain
 
 Unused Packages Found
 Threshold: 30 days | Found: 3 packages | Total size: 45.3 MB
@@ -367,14 +367,14 @@ Threshold: 30 days | Found: 3 packages | Total size: 45.3 MB
     -> Package 'unused-python-lib' is not protected
 
 # Remove them
-$ termtrace clean --days 30
+$ pkgtrace clean --days 30
 ```
 
 ### Understanding Dependencies
 
 ```bash
 # See why a package is protected
-$ termtrace deps rust --tree
+$ pkgtrace deps rust --tree
 
 Dependency tree for 'rust' (max depth: 10):
 ├── clang
@@ -390,18 +390,18 @@ Dependency tree for 'rust' (max depth: 10):
 
 ```bash
 # Export your package list
-$ termtrace export --format json --output packages.json
+$ pkgtrace export --format json --output packages.json
 
 # On a new device, install all packages
-$ termtrace import packages.json --dry-run
-$ termtrace import packages.json
+$ pkgtrace import packages.json --dry-run
+$ pkgtrace import packages.json
 ```
 
 ### Generating Dependency Graphs
 
 ```bash
 # Generate DOT format for visualization
-$ termtrace graph rust --format dot --output graph.dot
+$ pkgtrace graph rust --format dot --output graph.dot
 
 # Convert to PNG (requires graphviz)
 $ dot -Tpng graph.dot -o graph.png
@@ -416,7 +416,7 @@ If a package is not showing up in scans:
 1. Ensure the package is actually installed
 2. Check if it's in a non-standard location
 3. Add the path to scan_dirs in config
-4. Run termtrace scan --force
+4. Run pkgtrace scan --force
 
 ### High Memory Usage
 
@@ -424,7 +424,7 @@ For large package sets:
 
 1. Reduce parallel_scans in config
 2. Use --dry-run before actual operations
-3. Clear cache with rm -rf ~/.config/termtrace/cache
+3. Clear cache with rm -rf ~/.config/pkgtrace/cache
 
 ### Slow Scans
 
@@ -434,7 +434,7 @@ For large package sets:
 
 ### Logging
 
-Logs are stored in ~/.config/termtrace/termtrace.log. The log includes:
+Logs are stored in ~/.config/pkgtrace/pkgtrace.log. The log includes:
 
 · Package installations and removals
 · Package usage events
@@ -445,7 +445,7 @@ Logs are stored in ~/.config/termtrace/termtrace.log. The log includes:
 ### View logs:
 
 ```bash
-tail -f ~/.config/termtrace/termtrace.log
+tail -f ~/.config/pkgtrace/pkgtrace.log
 ```
 
 ### Development
@@ -453,8 +453,8 @@ tail -f ~/.config/termtrace/termtrace.log
 ###### Building from Source
 
 ```bash
-git clone https://github.com/oboobotenefiok/termtrace
-cd termtrace
+git clone https://github.com/oboobotenefiok/pkgtrace
+cd pkgtrace
 cargo build --release
 ```
 
@@ -491,7 +491,7 @@ MIT License - see LICENSE file for details.
 
 ### Support
 
-- GitHub Issues: https://github.com/oboobotenefiok/termtrace/issues
+- GitHub Issues: https://github.com/oboobotenefiok/pkgtrace/issues
 - My mail: oboobotenefiok@gmail.com
 - Twitter DM: x.com/oboobotenefiok
 
@@ -507,7 +507,7 @@ Built for the Termux community to keep Android terminals clean and efficient.
 #!/bin/bash
 set -e
 
-echo "Building termtrace..."
+echo "Building pkgtrace..."
 
 # Check for Rust
 if ! command -v cargo &> /dev/null; then
@@ -529,8 +529,8 @@ echo "Running tests..."
 cargo test
 
 # Check binary size
-if [ -f "target/release/termtrace" ]; then
-    SIZE=$(du -h target/release/termtrace | cut -f1)
+if [ -f "target/release/pkgtrace" ]; then
+    SIZE=$(du -h target/release/pkgtrace | cut -f1)
     echo "Binary size: $SIZE"
 else
     echo "Error: Build failed - binary not found"
@@ -541,13 +541,13 @@ fi
 if command -v pandoc &> /dev/null; then
     echo "Generating man page..."
     if [ -f "README.md" ]; then
-        pandoc -s -t man README.md -o termtrace.1
-        echo "Man page generated: termtrace.1"
+        pandoc -s -t man README.md -o pkgtrace.1
+        echo "Man page generated: pkgtrace.1"
     fi
 fi
 
 echo "Build complete!"
-echo "Install with: cp target/release/termtrace /data/data/com.termux/files/usr/bin/"
+echo "Install with: cp target/release/pkgtrace /data/data/com.termux/files/usr/bin/"
 echo "Or run: ./install.sh"
 ```
 
@@ -557,7 +557,7 @@ install.sh
 #!/bin/bash
 set -e
 
-echo "termtrace Installer"
+echo "pkgtrace Installer"
 echo "=================="
 echo
 
@@ -575,21 +575,21 @@ fi
 # Determine installation directory
 if [ -d "/data/data/com.termux/files/usr/bin" ]; then
     INSTALL_DIR="/data/data/com.termux/files/usr/bin"
-    CONFIG_DIR="/data/data/com.termux/files/home/.config/termtrace"
+    CONFIG_DIR="/data/data/com.termux/files/home/.config/pkgtrace"
 elif [ -d "$HOME/.local/bin" ]; then
     INSTALL_DIR="$HOME/.local/bin"
-    CONFIG_DIR="$HOME/.config/termtrace"
+    CONFIG_DIR="$HOME/.config/pkgtrace"
 else
     INSTALL_DIR="/usr/local/bin"
-    CONFIG_DIR="$HOME/.config/termtrace"
+    CONFIG_DIR="$HOME/.config/pkgtrace"
 fi
 
 echo "Installation directory: $INSTALL_DIR"
 echo "Config directory: $CONFIG_DIR"
 
 # Build if not already built
-if [ ! -f "target/release/termtrace" ]; then
-    echo "Building termtrace..."
+if [ ! -f "target/release/pkgtrace" ]; then
+    echo "Building pkgtrace..."
     if [ -f "build.sh" ]; then
         ./build.sh
     else
@@ -603,16 +603,16 @@ mkdir -p "$CONFIG_DIR"
 
 # Install binary
 echo "Installing binary..."
-cp target/release/termtrace "$INSTALL_DIR/"
-chmod 755 "$INSTALL_DIR/termtrace"
+cp target/release/pkgtrace "$INSTALL_DIR/"
+chmod 755 "$INSTALL_DIR/pkgtrace"
 
 # Create default config if not exists
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
     echo "Creating default configuration..."
     cat > "$CONFIG_DIR/config.toml" << 'EOF'
-log_file = "/data/data/com.termux/files/home/.config/termtrace/termtrace.log"
-db_file = "/data/data/com.termux/files/home/.config/termtrace/packages.db.json"
-cache_dir = "/data/data/com.termux/files/home/.config/termtrace/cache"
+log_file = "/data/data/com.termux/files/home/.config/pkgtrace/pkgtrace.log"
+db_file = "/data/data/com.termux/files/home/.config/pkgtrace/packages.db.json"
+cache_dir = "/data/data/com.termux/files/home/.config/pkgtrace/cache"
 auto_scan = true
 scan_interval = 86400
 max_log_size = 10485760
@@ -647,13 +647,13 @@ fi
 
 # Initial scan if requested
 echo ""
-echo "termtrace installed successfully!"
+echo "pkgtrace installed successfully!"
 echo ""
 echo "Run initial scan? (y/N)"
 read -r response
 if [[ "$response" =~ ^[Yy]$ ]]; then
     echo "Running initial scan..."
-    "$INSTALL_DIR/termtrace" scan
+    "$INSTALL_DIR/pkgtrace" scan
 fi
 
 # Add to PATH if needed
@@ -670,21 +670,21 @@ echo "Generate shell completion? (y/N)"
 read -r response
 if [[ "$response" =~ ^[Yy]$ ]]; then
     echo "Generating completions..."
-    if [ -f "$INSTALL_DIR/termtrace" ]; then
-        "$INSTALL_DIR/termtrace" --help > /dev/null 2>&1
+    if [ -f "$INSTALL_DIR/pkgtrace" ]; then
+        "$INSTALL_DIR/pkgtrace" --help > /dev/null 2>&1
     fi
     echo "Completions generated"
 fi
 
 echo ""
 echo "Installation complete!"
-echo "Run 'termtrace --help' to get started."
+echo "Run 'pkgtrace --help' to get started."
 echo ""
 echo "Quick start:"
-echo "  termtrace scan          # Scan all packages"
-echo "  termtrace list          # List installed packages"
-echo "  termtrace unused        # Find unused packages"
-echo "  termtrace clean         # Clean up unused packages"
+echo "  pkgtrace scan          # Scan all packages"
+echo "  pkgtrace list          # List installed packages"
+echo "  pkgtrace unused        # Find unused packages"
+echo "  pkgtrace clean         # Clean up unused packages"
 ```
 
 ## LICENSE
@@ -737,8 +737,8 @@ Cargo.lock
 *.iml
 
 # Build artifacts
-termtrace
-termtrace.exe
+pkgtrace
+pkgtrace.exe
 *.o
 *.so
 *.dylib

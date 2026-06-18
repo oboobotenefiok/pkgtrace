@@ -1,140 +1,148 @@
-use anyhow::{Result, anyhow};
-use rayon::prelude::*;
-use serde_json;
 use std::{
     collections::HashSet,
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::Command,
     sync::Arc,
-    os::unix::fs::PermissionsExt,
+    time::SystemTime,
 };
+
+use anyhow::{Result, anyhow};
+use rayon::prelude::*;
+use serde_json;
 use walkdir::WalkDir;
 use which::which;
+
 use crate::{
     models::*,
     config::Config,
     utils,
 };
 
-pub struct PackageScanner; // This is a unit struct. Remember? There's nothing inside. We only use it to confirm something happened - worst explanation
+pub struct PackageScanner;
 
 impl PackageScanner {
-// The config clone arrives here from the tracker.
-// This is where the real thing happens.
-    pub fn scan_all(config: Arc<Config>) -> Result<HashSet<Package>> {
-    // We create an empty in-memory DataBase with a(n) hashmap. Mutable because we will constantly update it in the loop below(a for loop of course!).
-        let mut all_packages = HashSet::new();
-//Remember that config is an Arc<Config> type and config is from the Config fig in the config file - worst explanation! So, we apply a Config impl method: get_scan_dirs
-        let scan_dirs = config.get_scan_dirs();
-        // We then fetch the excluded patterns so we don't hurt the developers by uninstalling their termux root, lol.
-        let exclude_patterns = config.get_exclude_patterns();
+    // ============ MAIN SCAN ENTRY POINT ============
 
-        let results: Vec<Result<HashSet<Package>>> = vec![
-            Self::scan_pkg(),
-            Self::scan_cargo(),
-            Self::scan_pip(),
-            Self::scan_npm(),
-            Self::scan_gem(),
-            Self::scan_manual(scan_dirs, exclude_patterns),
-        ]
+  pub fn scan_all(config: Arc<Config>) -> Result<HashSet<Package>> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    
+    let mut all_packages = HashSet::new();
+    let scan_dirs = config.get_scan_dirs();
+    let exclude_patterns = config.get_exclude_patterns();
+
+    // Progress bar for scanning sources
+    let pb = ProgressBar::new(6);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} sources")
+        .unwrap()
+        .progress_chars("#>-"));
+    
+    pb.set_message("Scanning package sources");
+
+    let sources = vec![
+        ("pkg", Self::scan_pkg_if_needed(Self::get_pkg_db_modified(), Self::is_cache_fresh(&config))),
+        ("cargo", Self::scan_cargo()),
+        ("pip", Self::scan_pip()),
+        ("npm", Self::scan_npm()),
+        ("gem", Self::scan_gem()),
+        ("manual", Self::scan_manual(scan_dirs, exclude_patterns)),
+    ];
+
+    let results: Vec<_> = sources
         .into_par_iter()
+        .map(|(name, result)| {
+            pb.inc(1);
+            pb.set_message(format!("Scanning {}", name));
+            (name, result)
+        })
         .collect();
-// We iterate over each result and return a result Ok containing the package itself to the hashmap. Remembering that the return type of this function is Result<HashSet<Package>> will boost your understanding right here right now.
-        for result in results {
-       // This assigns each result to a new variable packages, and pushes it to the all_packages hasmap at the start of this function.
-            if let Ok(packages) = result {
-                all_packages.extend(packages);
-            }
+
+    for (name, result) in results {
+        if let Ok(packages) = result {
+            let count = packages.len();
+            all_packages.extend(packages);
+            pb.println(format!("✓ {}: {} packages", name, count));
         }
-
-        Self::merge_duplicates(&mut all_packages);
-        Self::enrich_package_info(&mut all_packages)?;
-
-        Ok(all_packages)
     }
 
-    fn merge_duplicates(packages: &mut HashSet<Package>) {
-    // We create new HashSets to store instances of what to keep and what not to.
-        let mut to_remove = Vec::new();
-        let mut to_keep = Vec::new();
+    pb.finish_with_message("Scan complete");
 
-// We create an empty key value pair for the set
-        let mut names: std::collections::HashMap<String, Vec<Package>> = std::collections::HashMap::new();
-        for pkg in packages.iter() {
-            names.entry(pkg.name.clone()).or_default().push(pkg.clone());
+    // Progress for post-processing
+    let pb2 = ProgressBar::new(2);
+    pb2.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} steps")
+        .unwrap()
+        .progress_chars("#>-"));
+    
+    pb2.set_message("Merging duplicates");
+    Self::merge_duplicates(&mut all_packages);
+    pb2.inc(1);
+    
+    pb2.set_message("Enriching package info");
+    Self::enrich_package_info(&mut all_packages)?;
+    pb2.inc(1);
+    
+    pb2.finish_with_message("Ready");
+
+    Ok(all_packages)
+}
+
+    // ============ SMART PKG SCANNING ============
+
+    fn get_pkg_db_modified() -> Option<SystemTime> {
+        let db_paths = [
+            "/data/data/com.termux/files/usr/lib/apt/lists/",
+            "/data/data/com.termux/files/usr/var/lib/dpkg/status",
+            "/data/data/com.termux/files/usr/var/lib/dpkg/available",
+        ];
+
+        let mut latest = None;
+        for path in db_paths {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                if let Ok(modified) = metadata.modified() {
+                    if latest.is_none() || modified > latest.unwrap() {
+                        latest = Some(modified);
+                    }
+                }
+            }
         }
+        latest
+    }
 
-        for (name, pkgs) in names {
-            if pkgs.len() > 1 {
-                if let Some(pkg_version) = pkgs.iter().find(|p| p.source == PackageSource::Pkg) {
-                    for pkg in &pkgs {
-                        if pkg.source != PackageSource::Pkg {
-                            to_remove.push(pkg.name.clone());
+    fn is_cache_fresh(config: &Config) -> bool {
+        // Check if package cache exists and is recent
+        let cache_file = config.db_file.join("packages.db.json");
+        if let Ok(metadata) = std::fs::metadata(&cache_file) {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(elapsed) = modified.elapsed() {
+                    // Cache is fresh if less than 1 hour old
+                    return elapsed.as_secs() < 3600;
+                }
+            }
+        }
+        false
+    }
+
+    fn scan_pkg_if_needed(db_modified: Option<SystemTime>, cache_fresh: bool) -> Result<HashSet<Package>> {
+        // If cache is fresh and database hasn't changed, skip scan
+        if cache_fresh {
+            if let Some(db_time) = db_modified {
+                if let Ok(cache_meta) = std::fs::metadata("packages.db.json") {
+                    if let Ok(cache_time) = cache_meta.modified() {
+                        if cache_time > db_time {
+                            // Cache is newer than database, skip scan
+                            return Ok(HashSet::new());
                         }
                     }
-                    to_keep.push(pkg_version.clone());
-                } else {
-                    let mut sorted = pkgs.clone();
-                    sorted.sort_by(|a, b| {
-                        b.installed_date.unwrap_or(0).cmp(&a.installed_date.unwrap_or(0))
-                    });
-                    to_keep.push(sorted[0].clone());
-                    for pkg in &sorted[1..] {
-                        to_remove.push(pkg.name.clone());
-                    }
                 }
-            } else if let Some(pkg) = pkgs.first() {
-                to_keep.push(pkg.clone());
             }
         }
 
-        for name in &to_remove {
-            packages.retain(|p| p.name != *name);
-        }
-
-        for pkg in to_keep {
-            packages.insert(pkg);
-        }
+        Self::scan_pkg()
     }
 
-    fn enrich_package_info(packages: &mut HashSet<Package>) -> Result<()> {
-        let packages_vec: Vec<Package> = packages.iter().cloned().collect();
-        for mut pkg in packages_vec {
-            let mut updated = false;
-            let mut new_pkg = pkg.clone();
-            
-            if new_pkg.size.is_none() {
-                new_pkg.size = utils::get_path_size(&new_pkg.install_path);
-                updated = true;
-            }
-
-            if new_pkg.installed_date.is_none() {
-                if let Ok(metadata) = std::fs::metadata(&new_pkg.install_path) {
-                    if let Ok(modified) = metadata.modified() {
-                        if let Ok(duration) = modified.elapsed() {
-                            let timestamp = chrono::Utc::now().timestamp() - duration.as_secs() as i64;
-                            new_pkg.installed_date = Some(timestamp);
-                            updated = true;
-                        }
-                    }
-                }
-            }
-
-            if new_pkg.checksum.is_none() && new_pkg.install_path.is_file() {
-                if let Ok(checksum) = utils::compute_file_checksum(&new_pkg.install_path) {
-                    new_pkg.checksum = Some(checksum);
-                    updated = true;
-                }
-            }
-
-            if updated {
-                packages.remove(&pkg);
-                packages.insert(new_pkg);
-            }
-        }
-
-        Ok(())
-    }
+    // ============ PKG SCANNER ============
 
     fn scan_pkg() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
@@ -182,6 +190,8 @@ impl PackageScanner {
         Ok(packages)
     }
 
+    // ============ CARGO SCANNER ============
+
     fn scan_cargo() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
 
@@ -223,8 +233,9 @@ impl PackageScanner {
             }
         }
 
+        // Get versions for cargo packages
         let packages_vec: Vec<Package> = packages.iter().cloned().collect();
-        for mut pkg in packages_vec {
+        for pkg in packages_vec {
             if let Ok(output) = Command::new(&pkg.install_path)
                 .arg("--version")
                 .output()
@@ -233,9 +244,10 @@ impl PackageScanner {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     if let Some(cap) = regex::Regex::new(r"v?(\d+\.\d+\.\d+)")?.captures(&stdout) {
                         if let Some(ver) = cap.get(1) {
-                            pkg.version = Some(ver.as_str().to_string());
+                            let mut new_pkg = pkg.clone();
+                            new_pkg.version = Some(ver.as_str().to_string());
                             packages.remove(&pkg);
-                            packages.insert(pkg);
+                            packages.insert(new_pkg);
                         }
                     }
                 }
@@ -244,6 +256,8 @@ impl PackageScanner {
 
         Ok(packages)
     }
+
+    // ============ PIP SCANNER ============
 
     fn scan_pip() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
@@ -309,6 +323,8 @@ impl PackageScanner {
         default_path.join(package)
     }
 
+    // ============ NPM SCANNER ============
+
     fn scan_npm() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
 
@@ -356,6 +372,8 @@ impl PackageScanner {
         Ok(packages)
     }
 
+    // ============ GEM SCANNER ============
+
     fn scan_gem() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
 
@@ -401,6 +419,8 @@ impl PackageScanner {
         Ok(packages)
     }
 
+    // ============ MANUAL SCANNER ============
+
     fn scan_manual(scan_dirs: Vec<PathBuf>, exclude_patterns: Vec<String>) -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
 
@@ -431,7 +451,7 @@ impl PackageScanner {
                                     });
 
                                     if !is_excluded {
-                                  let is_tracked = packages.iter().any(|p: &Package| p.name == name);
+                                        let is_tracked = packages.iter().any(|p: &Package| p.name == name);
                                         if !is_tracked {
                                             let size = Some(metadata.len());
                                             packages.insert(Package {
@@ -456,6 +476,7 @@ impl PackageScanner {
             }
         }
 
+        // Scan for build artifacts (Makefile, configure, etc.)
         for dir in source_dirs {
             if dir.exists() {
                 for entry in WalkDir::new(&dir)
@@ -500,6 +521,91 @@ impl PackageScanner {
         }
 
         Ok(packages)
+    }
+
+    // ============ POST-PROCESSING ============
+
+    fn merge_duplicates(packages: &mut HashSet<Package>) {
+        let mut to_remove = Vec::new();
+        let mut to_keep = Vec::new();
+
+        let mut names: std::collections::HashMap<String, Vec<Package>> = std::collections::HashMap::new();
+        for pkg in packages.iter() {
+            names.entry(pkg.name.clone()).or_default().push(pkg.clone());
+        }
+
+        for (name, pkgs) in names {
+            if pkgs.len() > 1 {
+                // Prefer pkg source over others
+                if let Some(pkg_version) = pkgs.iter().find(|p| p.source == PackageSource::Pkg) {
+                    for pkg in &pkgs {
+                        if pkg.source != PackageSource::Pkg {
+                            to_remove.push(pkg.name.clone());
+                        }
+                    }
+                    to_keep.push(pkg_version.clone());
+                } else {
+                    // Keep the most recently installed
+                    let mut sorted = pkgs.clone();
+                    sorted.sort_by(|a, b| {
+                        b.installed_date.unwrap_or(0).cmp(&a.installed_date.unwrap_or(0))
+                    });
+                    to_keep.push(sorted[0].clone());
+                    for pkg in &sorted[1..] {
+                        to_remove.push(pkg.name.clone());
+                    }
+                }
+            } else if let Some(pkg) = pkgs.first() {
+                to_keep.push(pkg.clone());
+            }
+        }
+
+        for name in &to_remove {
+            packages.retain(|p| p.name != *name);
+        }
+
+        for pkg in to_keep {
+            packages.insert(pkg);
+        }
+    }
+
+    fn enrich_package_info(packages: &mut HashSet<Package>) -> Result<()> {
+        let packages_vec: Vec<Package> = packages.iter().cloned().collect();
+        for pkg in packages_vec {
+            let mut updated = false;
+            let mut new_pkg = pkg.clone();
+            
+            if new_pkg.size.is_none() {
+                new_pkg.size = utils::get_path_size(&new_pkg.install_path);
+                updated = true;
+            }
+
+            if new_pkg.installed_date.is_none() {
+                if let Ok(metadata) = std::fs::metadata(&new_pkg.install_path) {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(duration) = modified.elapsed() {
+                            let timestamp = chrono::Utc::now().timestamp() - duration.as_secs() as i64;
+                            new_pkg.installed_date = Some(timestamp);
+                            updated = true;
+                        }
+                    }
+                }
+            }
+
+            if new_pkg.checksum.is_none() && new_pkg.install_path.is_file() {
+                if let Ok(checksum) = utils::compute_file_checksum(&new_pkg.install_path) {
+                    new_pkg.checksum = Some(checksum);
+                    updated = true;
+                }
+            }
+
+            if updated {
+                packages.remove(&pkg);
+                packages.insert(new_pkg);
+            }
+        }
+
+        Ok(())
     }
 }
 
