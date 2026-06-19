@@ -32,7 +32,7 @@ curl -sSL https://raw.githubusercontent.com/oboobotenefiok/pkgtrace/main/install
 ### Manual Install
 
 ```bash
-git clone https://github.com/termux/pkgtrace
+git clone https://github.com/oboobotenefiok/pkgtrace
 cd pkgtrace
 cargo build --release
 cp target/release/pkgtrace /data/data/com.termux/files/usr/bin/
