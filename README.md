@@ -1,6 +1,6 @@
 # pkgtrace - Advanced Package Tracker for Termux
 
-# 👀
+![pkgtrace](vault/hello.jpg)
 
 pkgtrace is a comprehensive package management tool for Termux that tracks all installed packages across multiple package managers (pkg, cargo, pip, npm, gem, manual) with intelligent dependency resolution and unused package detection.
 
