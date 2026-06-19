@@ -26,7 +26,7 @@ pkgtrace is a comprehensive package management tool for Termux that tracks all i
 ### Quick Install
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/termux/pkgtrace/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/oboobotenefiok/pkgtrace/main/install.sh | bash
 ```
 
 ### Manual Install
