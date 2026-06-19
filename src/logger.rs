@@ -1,23 +1,24 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde_json;
 use std::{
     collections::HashSet,
     fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, Write, BufRead, Seek, SeekFrom},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::Arc,
 };
 
-use crate::config::Config;
-use crate::models::{PackageEvent, LogAction, PackageSource};
+use crate::{
+    config::Config,
+    models::{LogAction, PackageEvent, PackageSource},
+};
 
 #[derive(Clone)]
 pub struct Logger {
     config: Arc<Config>,
     log_file: PathBuf,
-    // Cache for fast event lookups - using parking_lot::RwLock
     event_cache: Arc<RwLock<Option<Vec<PackageEvent>>>>,
     last_read_position: Arc<RwLock<u64>>,
 }
@@ -49,8 +50,6 @@ impl Logger {
         Ok(())
     }
 
-    // ============ EVENT LOGGING ============
-
     pub fn log_event(&self, event: &PackageEvent) -> Result<()> {
         self.rotate_if_needed()?;
 
@@ -64,7 +63,6 @@ impl Logger {
         writeln!(writer, "{}", json)?;
         writer.flush()?;
 
-        // Invalidate cache when new event is written
         let mut cache = self.event_cache.write();
         *cache = None;
         let mut pos = self.last_read_position.write();
@@ -73,7 +71,12 @@ impl Logger {
         Ok(())
     }
 
-    pub fn log_action(&self, action: LogAction, package: &str, details: Option<serde_json::Value>) -> Result<()> {
+    pub fn log_action(
+        &self,
+        action: LogAction,
+        package: &str,
+        details: Option<serde_json::Value>,
+    ) -> Result<()> {
         let event = PackageEvent {
             timestamp: Utc::now().timestamp(),
             package: package.to_string(),
@@ -88,22 +91,34 @@ impl Logger {
     }
 
     pub fn info(&self, message: &str) -> Result<()> {
-        self.log_action(LogAction::Info, "pkgtrace", Some(serde_json::json!({ "message": message })))
+        self.log_action(
+            LogAction::Info,
+            "pkgtrace",
+            Some(serde_json::json!({ "message": message })),
+        )
     }
 
     pub fn warning(&self, message: &str) -> Result<()> {
-        self.log_action(LogAction::Warning, "pkgtrace", Some(serde_json::json!({ "message": message })))
+        self.log_action(
+            LogAction::Warning,
+            "pkgtrace",
+            Some(serde_json::json!({ "message": message })),
+        )
     }
 
     pub fn error(&self, message: &str) -> Result<()> {
-        self.log_action(LogAction::Error, "pkgtrace", Some(serde_json::json!({ "message": message })))
+        self.log_action(
+            LogAction::Error,
+            "pkgtrace",
+            Some(serde_json::json!({ "message": message })),
+        )
     }
 
     pub fn log_install(&self, package: &str, source: &str) -> Result<()> {
         self.log_action(
             LogAction::Install,
             package,
-            Some(serde_json::json!({ "source": source }))
+            Some(serde_json::json!({ "source": source })),
         )
     }
 
@@ -111,7 +126,7 @@ impl Logger {
         self.log_action(
             LogAction::Remove,
             package,
-            Some(serde_json::json!({ "source": source }))
+            Some(serde_json::json!({ "source": source })),
         )
     }
 
@@ -123,15 +138,11 @@ impl Logger {
         self.log_action(
             LogAction::Scan,
             "pkgtrace",
-            Some(serde_json::json!({ "packages_found": count }))
+            Some(serde_json::json!({ "packages_found": count })),
         )
     }
 
-    // ============ EFFICIENT EVENT LOADING ============
-
-    /// Load all events from log file with caching
     pub fn load_all_events(&self) -> Result<Vec<PackageEvent>> {
-        // Check cache first
         {
             let cache = self.event_cache.read();
             if let Some(events) = &*cache {
@@ -139,7 +150,6 @@ impl Logger {
             }
         }
 
-        // Load from disk
         if !self.log_file.exists() {
             return Ok(Vec::new());
         }
@@ -156,47 +166,38 @@ impl Logger {
             }
         }
 
-        // Update cache
         let mut cache = self.event_cache.write();
         *cache = Some(events.clone());
 
         Ok(events)
     }
 
-    /// Load only new events since last read (incremental)
     pub fn load_new_events(&self) -> Result<Vec<PackageEvent>> {
         if !self.log_file.exists() {
             return Ok(Vec::new());
         }
 
-        use std::io::Read;
+        let file = OpenOptions::new().read(true).open(&self.log_file)?;
 
-        let file = OpenOptions::new()
-            .read(true)
-            .open(&self.log_file)?;
-        
         let mut reader = BufReader::new(file);
         let mut last_pos = self.last_read_position.write();
-        
-        // Seek to last read position
+
         reader.seek(SeekFrom::Start(*last_pos))?;
-        
+
         let mut new_events = Vec::new();
         let mut bytes_read = 0;
 
         for line in reader.by_ref().lines() {
             if let Ok(line) = line {
-                bytes_read += line.len() as u64 + 1; // +1 for newline
+                bytes_read += line.len() as u64 + 1;
                 if let Ok(event) = serde_json::from_str::<PackageEvent>(&line) {
                     new_events.push(event);
                 }
             }
         }
 
-        // Update position
         *last_pos += bytes_read;
 
-        // Update cache with new events
         if !new_events.is_empty() {
             let mut cache = self.event_cache.write();
             if let Some(existing) = cache.as_mut() {
@@ -209,7 +210,6 @@ impl Logger {
         Ok(new_events)
     }
 
-    /// Get events for a specific package
     pub fn get_events_for_package(&self, package: &str) -> Result<Vec<PackageEvent>> {
         let events = self.load_all_events()?;
         Ok(events
@@ -218,7 +218,6 @@ impl Logger {
             .collect())
     }
 
-    /// Get last use time for a package
     pub fn get_last_use(&self, package: &str) -> Result<Option<i64>> {
         let events = self.load_all_events()?;
         let last = events
@@ -229,7 +228,6 @@ impl Logger {
         Ok(last)
     }
 
-    /// Get usage count for a package
     pub fn get_usage_count(&self, package: &str) -> Result<usize> {
         let events = self.load_all_events()?;
         let count = events
@@ -239,7 +237,6 @@ impl Logger {
         Ok(count)
     }
 
-    /// Get all used packages
     pub fn get_used_packages(&self) -> Result<HashSet<String>> {
         let events = self.load_all_events()?;
         let mut used = HashSet::new();
@@ -250,8 +247,6 @@ impl Logger {
         }
         Ok(used)
     }
-
-    // ============ LOG QUERYING ============
 
     pub fn read_logs(&self, limit: usize) -> Result<Vec<PackageEvent>> {
         let events = self.load_all_events()?;
@@ -279,8 +274,6 @@ impl Logger {
     pub fn get_package_activity(&self, package: &str) -> Result<Vec<PackageEvent>> {
         self.get_events_for_package(package)
     }
-
-    // ============ LOG STATISTICS ============
 
     pub fn get_log_stats(&self) -> Result<LogStats> {
         if !self.log_file.exists() {
@@ -321,8 +314,6 @@ impl Logger {
         })
     }
 
-    // ============ LOG MAINTENANCE ============
-
     fn rotate_if_needed(&self) -> Result<()> {
         if !self.log_file.exists() {
             return Ok(());
@@ -331,24 +322,22 @@ impl Logger {
         let metadata = std::fs::metadata(&self.log_file)?;
         if metadata.len() > self.config.max_log_size {
             let timestamp = Utc::now().timestamp();
-            let rotated_path = self.log_file.parent()
+            let rotated_path = self
+                .log_file
+                .parent()
                 .unwrap_or(&PathBuf::from("."))
                 .join(format!("pkgtrace.{}.log", timestamp));
 
-            // Rename current log
             std::fs::rename(&self.log_file, &rotated_path)?;
 
-            // Create new log file
             File::create(&self.log_file)?;
 
-            // Keep last 1000 entries in new log
             if let Ok(entries) = self.read_logs(1000) {
                 for entry in entries {
                     self.log_event(&entry)?;
                 }
             }
 
-            // Clear cache after rotation
             let mut cache = self.event_cache.write();
             *cache = None;
             let mut pos = self.last_read_position.write();
@@ -364,13 +353,12 @@ impl Logger {
         if self.log_file.exists() {
             std::fs::remove_file(&self.log_file)?;
             File::create(&self.log_file)?;
-            
-            // Clear cache
+
             let mut cache = self.event_cache.write();
             *cache = None;
             let mut pos = self.last_read_position.write();
             *pos = 0;
-            
+
             self.info("Logs cleared")?;
         }
         Ok(())
@@ -389,7 +377,6 @@ impl Logger {
         &self.log_file
     }
 
-    /// Invalidate the event cache (useful when log file changes externally)
     pub fn invalidate_cache(&self) {
         let mut cache = self.event_cache.write();
         *cache = None;
@@ -397,7 +384,6 @@ impl Logger {
         *pos = 0;
     }
 
-    /// Force reload of all events from disk
     pub fn reload(&self) -> Result<()> {
         self.invalidate_cache();
         self.load_all_events()?;
@@ -441,7 +427,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::config::Config::default();
         config.log_file = dir.path().join("test.log");
-        
+
         let logger = Logger::new(Arc::new(config))?;
         assert!(logger.log_file.exists());
 
@@ -453,7 +439,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::config::Config::default();
         config.log_file = dir.path().join("test.log");
-        
+
         let logger = Logger::new(Arc::new(config))?;
 
         let event = PackageEvent {
@@ -481,10 +467,9 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::config::Config::default();
         config.log_file = dir.path().join("test.log");
-        
+
         let logger = Logger::new(Arc::new(config))?;
 
-        // Log multiple events
         for i in 0..5 {
             let event = PackageEvent {
                 timestamp: Utc::now().timestamp(),
@@ -501,7 +486,6 @@ mod tests {
         let events = logger.load_all_events()?;
         assert_eq!(events.len(), 5);
 
-        // Second load should use cache
         let events2 = logger.load_all_events()?;
         assert_eq!(events2.len(), 5);
 
@@ -513,7 +497,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::config::Config::default();
         config.log_file = dir.path().join("test.log");
-        
+
         let logger = Logger::new(Arc::new(config))?;
 
         let event = PackageEvent {
@@ -539,10 +523,9 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::config::Config::default();
         config.log_file = dir.path().join("test.log");
-        
+
         let logger = Logger::new(Arc::new(config))?;
 
-        // Log install event
         let install = PackageEvent {
             timestamp: Utc::now().timestamp(),
             package: "installed-pkg".to_string(),
@@ -554,7 +537,6 @@ mod tests {
         };
         logger.log_event(&install)?;
 
-        // Log use event
         let use_event = PackageEvent {
             timestamp: Utc::now().timestamp(),
             package: "used-pkg".to_string(),
@@ -579,7 +561,7 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::config::Config::default();
         config.log_file = dir.path().join("test.log");
-        
+
         let logger = Logger::new(Arc::new(config))?;
 
         logger.log_install("pkg1", "pkg")?;
@@ -604,11 +586,10 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::config::Config::default();
         config.log_file = dir.path().join("test.log");
-        config.max_log_size = 1024; // Small size to force rotation
+        config.max_log_size = 1024;
 
         let logger = Logger::new(Arc::new(config))?;
 
-        // Write many events to trigger rotation
         for i in 0..100 {
             let event = PackageEvent {
                 timestamp: Utc::now().timestamp(),
@@ -622,7 +603,6 @@ mod tests {
             logger.log_event(&event)?;
         }
 
-        // Check if rotation happened
         let log_dir = dir.path();
         let rotated_files: Vec<_> = std::fs::read_dir(log_dir)?
             .filter_map(|e| e.ok())
@@ -639,13 +619,11 @@ mod tests {
         let dir = tempdir()?;
         let mut config = crate::config::Config::default();
         config.log_file = dir.path().join("test.log");
-        
+
         let logger = Logger::new(Arc::new(config))?;
 
-        // Load events (populates cache)
         let _ = logger.load_all_events()?;
-        
-        // Add new event (should invalidate cache)
+
         let event = PackageEvent {
             timestamp: Utc::now().timestamp(),
             package: "new-pkg".to_string(),
@@ -657,10 +635,10 @@ mod tests {
         };
         logger.log_event(&event)?;
 
-        // Load again (should reload from disk)
         let events = logger.load_all_events()?;
         assert!(events.iter().any(|e| e.package == "new-pkg"));
 
         Ok(())
     }
 }
+

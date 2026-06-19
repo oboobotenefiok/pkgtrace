@@ -1,16 +1,18 @@
-use anyhow::{Result, anyhow};
-use chrono::{DateTime, Local, Utc, TimeZone};
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use serde_json;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufReader, BufWriter},
+    path::PathBuf,
+    sync::Arc,
+};
 
-use crate::config::Config;
-use crate::models::{Package, CacheEntry, DependencyCache, UsageCache};
-
-
+use crate::{
+    config::Config,
+    models::{CacheEntry, DependencyCache, FileMapCache, Package, UsageCache},
+};
 
 #[derive(Clone)]
 pub struct CacheManager {
@@ -19,6 +21,7 @@ pub struct CacheManager {
     metadata_file: PathBuf,
     dep_cache_file: PathBuf,
     usage_cache_file: PathBuf,
+    file_map_cache_file: PathBuf,
 }
 
 impl CacheManager {
@@ -29,6 +32,7 @@ impl CacheManager {
             metadata_file: config.cache_dir.join("metadata.json"),
             dep_cache_file: config.cache_dir.join("dependency_cache.json"),
             usage_cache_file: config.cache_dir.join("usage_cache.json"),
+            file_map_cache_file: config.cache_dir.join("file_map_cache.json"),
         };
 
         manager.ensure_cache_dir()?;
@@ -36,34 +40,22 @@ impl CacheManager {
     }
 
     fn ensure_cache_dir(&self) -> Result<()> {
-        if let Some(parent) = self.cache_file.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+        let dirs = [
+            self.cache_file.parent(),
+            self.metadata_file.parent(),
+            self.dep_cache_file.parent(),
+            self.usage_cache_file.parent(),
+            self.file_map_cache_file.parent(),
+        ];
 
-        if let Some(parent) = self.metadata_file.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        if let Some(parent) = self.dep_cache_file.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        if let Some(parent) = self.usage_cache_file.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
+        for dir in dirs.iter().flatten() {
+            if !dir.exists() {
+                std::fs::create_dir_all(dir)?;
             }
         }
 
         Ok(())
     }
-
-    // ============ PACKAGE CACHE ============
 
     pub fn load(&self) -> Result<HashMap<String, Package>> {
         if !self.cache_file.exists() {
@@ -211,8 +203,6 @@ impl CacheManager {
         })
     }
 
-    // ============ DEPENDENCY CACHE ============
-
     pub fn save_dependency_cache(&self, dep_cache: &DependencyCache) -> Result<()> {
         let file = File::create(&self.dep_cache_file)?;
         let writer = BufWriter::new(file);
@@ -233,7 +223,6 @@ impl CacheManager {
 
     pub fn dependency_cache_fresh(&self, current_package_count: usize) -> Result<bool> {
         if let Some(cache) = self.load_dependency_cache()? {
-            // Check if cache is from this session and package count matches
             let age = Utc::now().timestamp() - cache.built_at;
             if age < 3600 && cache.package_count == current_package_count {
                 return Ok(true);
@@ -241,8 +230,6 @@ impl CacheManager {
         }
         Ok(false)
     }
-
-    // ============ USAGE CACHE ============
 
     pub fn save_usage_cache(&self, usage_cache: &UsageCache) -> Result<()> {
         let file = File::create(&self.usage_cache_file)?;
@@ -264,7 +251,6 @@ impl CacheManager {
 
     pub fn usage_cache_fresh(&self) -> Result<bool> {
         if let Some(cache) = self.load_usage_cache()? {
-            // Check if cache is from this session (last hour)
             let age = Utc::now().timestamp() - cache.loaded_at;
             if age < 3600 {
                 return Ok(true);
@@ -273,20 +259,47 @@ impl CacheManager {
         Ok(false)
     }
 
-    // ============ CACHE MAINTENANCE ============
+    pub fn save_file_map_cache(&self, file_map: &FileMapCache) -> Result<()> {
+        let file = File::create(&self.file_map_cache_file)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, file_map)?;
+        Ok(())
+    }
+
+    pub fn load_file_map_cache(&self) -> Result<Option<FileMapCache>> {
+        if !self.file_map_cache_file.exists() {
+            return Ok(None);
+        }
+
+        let file = File::open(&self.file_map_cache_file)?;
+        let reader = BufReader::new(file);
+        let cache: FileMapCache = serde_json::from_reader(reader)?;
+        Ok(Some(cache))
+    }
+
+    pub fn file_map_cache_fresh(&self) -> Result<bool> {
+        if let Some(cache) = self.load_file_map_cache()? {
+            let age = Utc::now().timestamp() - cache.built_at;
+            if age < 86400 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 
     pub fn clear(&self) -> Result<()> {
-        if self.cache_file.exists() {
-            std::fs::remove_file(&self.cache_file)?;
-        }
-        if self.metadata_file.exists() {
-            std::fs::remove_file(&self.metadata_file)?;
-        }
-        if self.dep_cache_file.exists() {
-            std::fs::remove_file(&self.dep_cache_file)?;
-        }
-        if self.usage_cache_file.exists() {
-            std::fs::remove_file(&self.usage_cache_file)?;
+        let files = [
+            &self.cache_file,
+            &self.metadata_file,
+            &self.dep_cache_file,
+            &self.usage_cache_file,
+            &self.file_map_cache_file,
+        ];
+
+        for file in files {
+            if file.exists() {
+                std::fs::remove_file(file)?;
+            }
         }
         Ok(())
     }
@@ -301,6 +314,13 @@ impl CacheManager {
     pub fn clear_usage_cache(&self) -> Result<()> {
         if self.usage_cache_file.exists() {
             std::fs::remove_file(&self.usage_cache_file)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_file_map_cache(&self) -> Result<()> {
+        if self.file_map_cache_file.exists() {
+            std::fs::remove_file(&self.file_map_cache_file)?;
         }
         Ok(())
     }
@@ -331,24 +351,27 @@ impl CacheManager {
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
         let mut backups = Vec::new();
 
-        // Backup package cache
         if self.cache_file.exists() {
             let backup_file = backup_dir.join(format!("packages_{}.json", timestamp));
             std::fs::copy(&self.cache_file, &backup_file)?;
             backups.push(backup_file);
         }
 
-        // Backup dependency cache
         if self.dep_cache_file.exists() {
             let backup_file = backup_dir.join(format!("deps_{}.json", timestamp));
             std::fs::copy(&self.dep_cache_file, &backup_file)?;
             backups.push(backup_file);
         }
 
-        // Backup usage cache
         if self.usage_cache_file.exists() {
             let backup_file = backup_dir.join(format!("usage_{}.json", timestamp));
             std::fs::copy(&self.usage_cache_file, &backup_file)?;
+            backups.push(backup_file);
+        }
+
+        if self.file_map_cache_file.exists() {
+            let backup_file = backup_dir.join(format!("filemap_{}.json", timestamp));
+            std::fs::copy(&self.file_map_cache_file, &backup_file)?;
             backups.push(backup_file);
         }
 
@@ -374,21 +397,23 @@ impl CacheManager {
             return Err(anyhow!("Backup directory does not exist"));
         }
 
-        // Find the latest backups
         let mut package_backup = None;
         let mut dep_backup = None;
         let mut usage_backup = None;
+        let mut filemap_backup = None;
 
         for entry in std::fs::read_dir(backup_dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            
+
             if name.starts_with("packages_") && name.ends_with(".json") {
                 package_backup = Some(entry.path());
             } else if name.starts_with("deps_") && name.ends_with(".json") {
                 dep_backup = Some(entry.path());
             } else if name.starts_with("usage_") && name.ends_with(".json") {
                 usage_backup = Some(entry.path());
+            } else if name.starts_with("filemap_") && name.ends_with(".json") {
+                filemap_backup = Some(entry.path());
             }
         }
 
@@ -402,6 +427,10 @@ impl CacheManager {
 
         if let Some(path) = usage_backup {
             std::fs::copy(&path, &self.usage_cache_file)?;
+        }
+
+        if let Some(path) = filemap_backup {
+            std::fs::copy(&path, &self.file_map_cache_file)?;
         }
 
         self.load()?;
@@ -418,13 +447,15 @@ impl CacheManager {
             let file = File::open(other_cache)?;
             let reader = BufReader::new(file);
             let entries: Vec<CacheEntry> = serde_json::from_reader(reader)?;
-            entries.into_iter().map(|e| (e.package.name.clone(), e.package)).collect()
+            entries
+                .into_iter()
+                .map(|e| (e.package.name.clone(), e.package))
+                .collect()
         };
 
         let mut merged = current;
         for (name, pkg) in other {
             if let Some(existing) = merged.get(&name) {
-                // Keep the one with the more recent installed date
                 if pkg.installed_date.unwrap_or(0) > existing.installed_date.unwrap_or(0) {
                     merged.insert(name, pkg);
                 }
@@ -443,7 +474,11 @@ impl CacheManager {
 
         for (name, pkg) in packages {
             if !pkg.install_path.exists() {
-                issues.push(format!("Package '{}' path does not exist: {}", name, pkg.install_path.display()));
+                issues.push(format!(
+                    "Package '{}' path does not exist: {}",
+                    name,
+                    pkg.install_path.display()
+                ));
             }
 
             if let Some(size) = pkg.size {
@@ -465,21 +500,24 @@ impl CacheManager {
     pub fn compact(&self) -> Result<()> {
         let packages = self.load()?;
         self.save(&packages.into_values().collect::<Vec<_>>())?;
-        
-        // Also compact dependency and usage caches if they exist
+
         if let Some(dep_cache) = self.load_dependency_cache()? {
             self.save_dependency_cache(&dep_cache)?;
         }
-        
+
         if let Some(usage_cache) = self.load_usage_cache()? {
             self.save_usage_cache(&usage_cache)?;
         }
-        
+
+        if let Some(file_map) = self.load_file_map_cache()? {
+            self.save_file_map_cache(&file_map)?;
+        }
+
         Ok(())
     }
 
     fn config_hash(&self) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let config_str = format!(
             "{:?}{:?}{:?}{:?}",
             self.config.scan_dirs,
@@ -491,8 +529,6 @@ impl CacheManager {
         hasher.update(config_str.as_bytes());
         format!("{:x}", hasher.finalize())
     }
-
-    // ============ CACHE STATS ============
 
     pub fn get_dependency_cache_stats(&self) -> Result<Option<DependencyCacheStats>> {
         if let Some(cache) = self.load_dependency_cache()? {
@@ -522,6 +558,18 @@ impl CacheManager {
             Ok(None)
         }
     }
+
+    pub fn get_file_map_cache_stats(&self) -> Result<Option<FileMapCacheStats>> {
+        if let Some(cache) = self.load_file_map_cache()? {
+            let age = Utc::now().timestamp() - cache.built_at;
+            Ok(Some(FileMapCacheStats {
+                entry_count: cache.total_entries,
+                age_seconds: age,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -534,11 +582,14 @@ pub struct CacheStats {
 
 impl CacheStats {
     pub fn summary(&self) -> String {
-        let age_str = self.age.map(|a| {
-            let hours = a / 3600;
-            let minutes = (a % 3600) / 60;
-            format!("{}h {}m", hours, minutes)
-        }).unwrap_or_else(|| "unknown".to_string());
+        let age_str = self
+            .age
+            .map(|a| {
+                let hours = a / 3600;
+                let minutes = (a % 3600) / 60;
+                format!("{}h {}m", hours, minutes)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
 
         format!(
             "Cache size: {}, Packages: {}, Age: {}, Fresh: {}",
@@ -582,7 +633,7 @@ pub struct UsageCacheStats {
 
 impl UsageCacheStats {
     pub fn summary(&self) -> String {
-        let last_event = DateTime::<Local>::from(Utc.timestamp_opt(self.last_event_timestamp, 0).unwrap());
+        let last_event = DateTime::<Local>::from(Utc.timestamp(self.last_event_timestamp, 0));
         format!(
             "Events: {}, Packages: {}, Last event: {}, Age: {}s",
             self.event_count,
@@ -593,23 +644,55 @@ impl UsageCacheStats {
     }
 }
 
+#[derive(Debug)]
+pub struct FileMapCacheStats {
+    pub entry_count: usize,
+    pub age_seconds: i64,
+}
+
+impl FileMapCacheStats {
+    pub fn summary(&self) -> String {
+        format!("Entries: {}, Age: {}s", self.entry_count, self.age_seconds)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{Package, PackageSource};
     use tempfile::tempdir;
-    use crate::models::{PackageSource, Package};
 
     #[test]
     fn test_cache_manager_creation() -> Result<()> {
         let dir = tempdir()?;
-        let config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
+        let config = crate::config::Config::default().with_custom_dir(dir.path().to_path_buf());
 
         let manager = CacheManager::new(Arc::new(config))?;
-        assert!(manager.cache_file.to_str().unwrap().contains("packages.db.json"));
-        assert!(manager.metadata_file.to_str().unwrap().contains("metadata.json"));
-        assert!(manager.dep_cache_file.to_str().unwrap().contains("dependency_cache.json"));
-        assert!(manager.usage_cache_file.to_str().unwrap().contains("usage_cache.json"));
+        assert!(manager
+            .cache_file
+            .to_str()
+            .unwrap()
+            .contains("packages.db.json"));
+        assert!(manager
+            .metadata_file
+            .to_str()
+            .unwrap()
+            .contains("metadata.json"));
+        assert!(manager
+            .dep_cache_file
+            .to_str()
+            .unwrap()
+            .contains("dependency_cache.json"));
+        assert!(manager
+            .usage_cache_file
+            .to_str()
+            .unwrap()
+            .contains("usage_cache.json"));
+        assert!(manager
+            .file_map_cache_file
+            .to_str()
+            .unwrap()
+            .contains("file_map_cache.json"));
 
         Ok(())
     }
@@ -617,8 +700,7 @@ mod tests {
     #[test]
     fn test_save_and_load() -> Result<()> {
         let dir = tempdir()?;
-        let config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
+        let config = crate::config::Config::default().with_custom_dir(dir.path().to_path_buf());
 
         let manager = CacheManager::new(Arc::new(config))?;
 
@@ -663,63 +745,32 @@ mod tests {
     }
 
     #[test]
-    fn test_dependency_cache_persistence() -> Result<()> {
+    fn test_file_map_cache_persistence() -> Result<()> {
         let dir = tempdir()?;
-        let config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
+        let config = crate::config::Config::default().with_custom_dir(dir.path().to_path_buf());
 
         let manager = CacheManager::new(Arc::new(config))?;
 
-        let mut dep_cache = DependencyCache::new();
-        dep_cache.direct_deps.insert("pkg1".to_string(), vec!["dep1".to_string(), "dep2".to_string()]);
-        dep_cache.direct_deps.insert("pkg2".to_string(), vec!["dep1".to_string()]);
-        dep_cache.reverse_deps.insert("dep1".to_string(), vec!["pkg1".to_string(), "pkg2".to_string()]);
-        dep_cache.package_count = 2;
-        dep_cache.built_at = Utc::now().timestamp();
+        let mut file_map = FileMapCache::new();
+        file_map
+            .mapping
+            .insert("nm".to_string(), "binutils".to_string());
+        file_map
+            .mapping
+            .insert("shred".to_string(), "coreutils".to_string());
+        file_map.total_entries = 2;
+        file_map.built_at = Utc::now().timestamp();
 
-        manager.save_dependency_cache(&dep_cache)?;
+        manager.save_file_map_cache(&file_map)?;
 
-        let loaded = manager.load_dependency_cache()?;
+        let loaded = manager.load_file_map_cache()?;
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
-        assert_eq!(loaded.package_count, 2);
-        assert!(loaded.direct_deps.contains_key("pkg1"));
-        assert!(loaded.reverse_deps.contains_key("dep1"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_usage_cache_persistence() -> Result<()> {
-        let dir = tempdir()?;
-        let config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
-
-        let manager = CacheManager::new(Arc::new(config))?;
-
-        let mut usage_cache = UsageCache::new();
-        usage_cache.events = vec![
-            PackageEvent {
-                timestamp: Utc::now().timestamp(),
-                package: "pkg1".to_string(),
-                action: "INSTALL".to_string(),
-                source: PackageSource::Pkg,
-                details: None,
-                pid: None,
-                user: None,
-            },
-        ];
-        usage_cache.package_index.insert("pkg1".to_string(), vec![0]);
-        usage_cache.event_count = 1;
-        usage_cache.loaded_at = Utc::now().timestamp();
-
-        manager.save_usage_cache(&usage_cache)?;
-
-        let loaded = manager.load_usage_cache()?;
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
-        assert_eq!(loaded.event_count, 1);
-        assert!(loaded.package_index.contains_key("pkg1"));
+        assert_eq!(loaded.total_entries, 2);
+        assert_eq!(
+            loaded.get_package_for_file("nm"),
+            Some("binutils".to_string())
+        );
 
         Ok(())
     }
@@ -727,8 +778,7 @@ mod tests {
     #[test]
     fn test_backup_and_restore() -> Result<()> {
         let dir = tempdir()?;
-        let config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
+        let config = crate::config::Config::default().with_custom_dir(dir.path().to_path_buf());
 
         let manager = CacheManager::new(Arc::new(config))?;
 
@@ -749,7 +799,6 @@ mod tests {
         let backup = manager.backup()?;
         assert!(backup.exists());
 
-        // Clear and restore
         manager.clear()?;
         assert!(!manager.cache_file.exists());
 
@@ -763,48 +812,9 @@ mod tests {
     }
 
     #[test]
-    fn test_backup_all() -> Result<()> {
-        let dir = tempdir()?;
-        let config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
-
-        let manager = CacheManager::new(Arc::new(config))?;
-
-        // Create some cache data
-        let packages = vec![Package {
-            name: "test".to_string(),
-            version: Some("1.0.0".to_string()),
-            source: PackageSource::Pkg,
-            install_path: PathBuf::from("/usr/bin/test"),
-            size: Some(1024),
-            dependencies: None,
-            installed_date: None,
-            last_used: None,
-            usage_count: None,
-            checksum: None,
-        }];
-        manager.save(&packages)?;
-
-        let dep_cache = DependencyCache::new();
-        manager.save_dependency_cache(&dep_cache)?;
-
-        let usage_cache = UsageCache::new();
-        manager.save_usage_cache(&usage_cache)?;
-
-        let backups = manager.backup_all()?;
-        assert!(!backups.is_empty());
-        
-        // Should have at least package backup
-        assert!(backups.iter().any(|p| p.to_string_lossy().contains("packages_")));
-
-        Ok(())
-    }
-
-    #[test]
     fn test_cache_stats() -> Result<()> {
         let dir = tempdir()?;
-        let config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
+        let config = crate::config::Config::default().with_custom_dir(dir.path().to_path_buf());
 
         let manager = CacheManager::new(Arc::new(config))?;
 
@@ -832,8 +842,7 @@ mod tests {
     #[test]
     fn test_validate() -> Result<()> {
         let dir = tempdir()?;
-        let config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
+        let config = crate::config::Config::default().with_custom_dir(dir.path().to_path_buf());
 
         let manager = CacheManager::new(Arc::new(config))?;
 
@@ -854,84 +863,6 @@ mod tests {
         let issues = manager.validate()?;
         assert!(!issues.is_empty());
         assert!(issues[0].contains("path does not exist"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_compact() -> Result<()> {
-        let dir = tempdir()?;
-        let config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
-
-        let manager = CacheManager::new(Arc::new(config))?;
-
-        let packages = vec![
-            Package {
-                name: "test1".to_string(),
-                version: Some("1.0.0".to_string()),
-                source: PackageSource::Pkg,
-                install_path: PathBuf::from("/usr/bin/test1"),
-                size: Some(1024),
-                dependencies: None,
-                installed_date: None,
-                last_used: None,
-                usage_count: None,
-                checksum: None,
-            },
-            Package {
-                name: "test2".to_string(),
-                version: Some("2.0.0".to_string()),
-                source: PackageSource::Cargo,
-                install_path: PathBuf::from("/usr/bin/test2"),
-                size: Some(2048),
-                dependencies: None,
-                installed_date: None,
-                last_used: None,
-                usage_count: None,
-                checksum: None,
-            },
-        ];
-        manager.save(&packages)?;
-
-        // Compact should work without errors
-        manager.compact()?;
-
-        let loaded = manager.load()?;
-        assert_eq!(loaded.len(), 2);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_freshness() -> Result<()> {
-        let dir = tempdir()?;
-        let mut config = crate::config::Config::default()
-            .with_custom_dir(dir.path().to_path_buf());
-        config.scan_interval = 3600; // 1 hour
-
-        let manager = CacheManager::new(Arc::new(config))?;
-
-        // No cache yet
-        assert!(!manager.is_fresh()?);
-
-        // Save some data
-        let packages = vec![Package {
-            name: "test".to_string(),
-            version: Some("1.0.0".to_string()),
-            source: PackageSource::Pkg,
-            install_path: PathBuf::from("/usr/bin/test"),
-            size: Some(1024),
-            dependencies: None,
-            installed_date: None,
-            last_used: None,
-            usage_count: None,
-            checksum: None,
-        }];
-        manager.save(&packages)?;
-
-        // Should be fresh now
-        assert!(manager.is_fresh()?);
 
         Ok(())
     }

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fmt,
     path::PathBuf,
-    collections::HashMap,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
@@ -63,7 +63,6 @@ pub struct Package {
     pub checksum: Option<String>,
 }
 
-// Custom equality: only name and source matter for identity
 impl PartialEq for Package {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name && self.source == other.source
@@ -72,7 +71,6 @@ impl PartialEq for Package {
 
 impl Eq for Package {}
 
-// Custom hash: only hash name and source
 impl std::hash::Hash for Package {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
@@ -143,20 +141,12 @@ pub struct PackageInfo {
     pub checksum: Option<String>,
 }
 
-// ============= NEW CACHE STRUCTURES =============
-
-/// Cached dependency information to avoid repeated pkg show calls
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DependencyCache {
-    /// Direct dependencies for each package: package_name -> [dependencies]
     pub direct_deps: HashMap<String, Vec<String>>,
-    /// Reverse dependencies: package_name -> [packages that depend on it]
     pub reverse_deps: HashMap<String, Vec<String>>,
-    /// When this cache was built
     pub built_at: i64,
-    /// How many packages were in the system when built
     pub package_count: usize,
-    /// Maximum depth of dependency tree
     pub max_depth: usize,
 }
 
@@ -188,18 +178,12 @@ impl DependencyCache {
     }
 }
 
-/// Cached usage events to avoid scanning the log file repeatedly
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsageCache {
-    /// All events in chronological order
     pub events: Vec<PackageEvent>,
-    /// Index of events by package name: package_name -> [event indices]
     pub package_index: HashMap<String, Vec<usize>>,
-    /// When this cache was loaded
     pub loaded_at: i64,
-    /// Last event timestamp in the cache
     pub last_event_timestamp: i64,
-    /// Total number of events
     pub event_count: usize,
 }
 
@@ -274,6 +258,39 @@ impl UsageCache {
         } else {
             None
         }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FileMapCache {
+    pub mapping: HashMap<String, String>,
+    pub built_at: i64,
+    pub total_entries: usize,
+}
+
+impl FileMapCache {
+    pub fn new() -> Self {
+        Self {
+            mapping: HashMap::new(),
+            built_at: 0,
+            total_entries: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mapping.is_empty()
+    }
+
+    pub fn get_package_for_file(&self, filename: &str) -> Option<String> {
+        if let Some(pkg) = self.mapping.get(filename) {
+            return Some(pkg.clone());
+        }
+        if let Some(stem) = filename.split('.').next() {
+            if let Some(pkg) = self.mapping.get(stem) {
+                return Some(pkg.clone());
+            }
+        }
+        None
     }
 }
 

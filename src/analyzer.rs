@@ -1,17 +1,11 @@
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
 
-use anyhow::{Result, anyhow};
-use chrono::{DateTime, Local, Utc, TimeZone};
-
-use crate::{
-    models::*,
-    tracker::Tracker,
-    utils,
-};
-
+use crate::{models::*, tracker::Tracker, utils};
 
 #[derive(Clone)]
 pub struct Analyzer {
@@ -27,8 +21,6 @@ impl Analyzer {
         self.tracker.clone()
     }
 
-    // ============ UNUSED PACKAGE ANALYSIS ============
-
     pub fn find_unused(&self, days_threshold: u32) -> Result<Vec<UnusedPackage>> {
         self.tracker.find_unused(days_threshold)
     }
@@ -37,13 +29,11 @@ impl Analyzer {
         self.tracker.find_unused_with_deps(days_threshold)
     }
 
-    // ============ COMPREHENSIVE ANALYSIS ============
-
     pub fn analyze(&self, days_threshold: u32) -> Result<AnalysisReport> {
         let unused = self.find_unused_with_deps(days_threshold)?;
         let all_packages = self.tracker.get_installed_packages_all()?;
         let used_packages = self.tracker.get_used_packages()?;
-        
+
         let mut report = AnalysisReport {
             total_packages: all_packages.len(),
             used_packages: used_packages.len(),
@@ -54,28 +44,26 @@ impl Analyzer {
             large_unused: Vec::new(),
             recommendations: Vec::new(),
         };
-        
-        // Calculate totals
+
         for pkg in &all_packages {
             if let Some(size) = pkg.size {
                 report.total_size += size;
             }
         }
-        
+
         for pkg in &unused {
             if let Some(size) = pkg.size {
                 report.potential_savings += size;
             }
         }
-        
-        // Group by source
+
         for pkg in &all_packages {
-            *report.packages_by_source
+            *report
+                .packages_by_source
                 .entry(pkg.source.to_string())
                 .or_insert(0) += 1;
         }
-        
-        // Find large unused packages (>10MB)
+
         for pkg in &unused {
             if let Some(size) = pkg.size {
                 if size > 10 * 1024 * 1024 {
@@ -83,19 +71,19 @@ impl Analyzer {
                 }
             }
         }
-        
-        // Generate recommendations
+
         if !unused.is_empty() {
             report.recommendations.push(format!(
                 "Remove {} unused packages to free up {}",
                 unused.len(),
                 utils::format_size(report.potential_savings)
             ));
-            
+
             if !report.large_unused.is_empty() {
                 report.recommendations.push(format!(
                     "Start with large packages: {}",
-                    report.large_unused
+                    report
+                        .large_unused
                         .iter()
                         .map(|p| p.name.clone())
                         .collect::<Vec<_>>()
@@ -103,16 +91,14 @@ impl Analyzer {
                 ));
             }
         }
-        
+
         Ok(report)
     }
-
-    // ============ DEPENDENCY GRAPH ============
 
     pub fn get_dependency_graph(&self, package: &str) -> Result<DependencyGraph> {
         let _deps = self.tracker.get_dependencies(package)?;
         let reverse_deps = self.tracker.get_reverse_dependencies(package)?;
-        
+
         let mut graph = DependencyGraph {
             root: package.to_string(),
             dependencies: Vec::new(),
@@ -121,15 +107,12 @@ impl Analyzer {
             cycles: Vec::new(),
             total_nodes: 0,
         };
-        
-        // Build dependency tree using cached data
+
         self.build_dependency_tree(package, &mut graph, 0, &mut HashSet::new())?;
-        
-        // Find cycles
         self.find_cycles(package, &mut graph)?;
-        
+
         graph.total_nodes = graph.dependencies.len() + 1;
-        
+
         Ok(graph)
     }
 
@@ -144,18 +127,17 @@ impl Analyzer {
             return Ok(());
         }
         visited.insert(package.to_string());
-        
+
         if depth > graph.depth {
             graph.depth = depth;
         }
-        
-        // Use cached dependencies
+
         let deps = self.tracker.get_dependencies(package)?;
-        
+
         for dep in deps {
             let version = self.get_package_version(&dep);
             let source = self.get_package_source(&dep);
-            
+
             graph.dependencies.push(DependencyNode {
                 name: dep.clone(),
                 depth: depth + 1,
@@ -163,12 +145,12 @@ impl Analyzer {
                 version,
                 source,
             });
-            
+
             if depth < 10 {
                 self.build_dependency_tree(&dep, graph, depth + 1, visited)?;
             }
         }
-        
+
         Ok(())
     }
 
@@ -187,8 +169,6 @@ impl Analyzer {
             PackageSource::Unknown
         }
     }
-
-    // ============ CYCLE DETECTION ============
 
     fn find_cycles(&self, package: &str, graph: &mut DependencyGraph) -> Result<()> {
         let mut visited = HashSet::new();
@@ -212,38 +192,39 @@ impl Analyzer {
             }
             return Ok(());
         }
-        
+
         if visited.contains(package) {
             return Ok(());
         }
-        
+
         visited.insert(package.to_string());
         path.push(package.to_string());
-        
+
         let deps = self.tracker.get_dependencies(package)?;
         for dep in deps {
             self.find_cycles_recursive(&dep, visited, path, graph)?;
         }
-        
+
         path.pop();
         Ok(())
     }
-
-    // ============ SUMMARY ============
 
     pub fn summary(&self) -> Result<String> {
         let all_packages = self.tracker.get_installed_packages_all()?;
         let used = self.tracker.get_used_packages()?;
         let total_size: u64 = all_packages.iter().filter_map(|p| p.size).sum();
-        
+
         let mut summary = String::new();
         summary.push_str("Package Summary\n");
         summary.push_str(&format!("{}\n", "=".repeat(40)));
         summary.push_str(&format!("Total packages:   {}\n", all_packages.len()));
         summary.push_str(&format!("Used packages:    {}\n", used.len()));
-        summary.push_str(&format!("Total size:       {}\n", utils::format_size(total_size)));
+        summary.push_str(&format!(
+            "Total size:       {}\n",
+            utils::format_size(total_size)
+        ));
         summary.push_str("\n");
-        
+
         let mut by_source: HashMap<String, (usize, u64)> = HashMap::new();
         for pkg in &all_packages {
             let entry = by_source.entry(pkg.source.to_string()).or_insert((0, 0));
@@ -252,80 +233,98 @@ impl Analyzer {
                 entry.1 += size;
             }
         }
-        
+
         summary.push_str("By source:\n");
         let mut sources: Vec<_> = by_source.into_iter().collect();
-        sources.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        sources.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
         for (source, (count, size)) in sources {
             summary.push_str(&format!(
-                "  {}: {} packages ({} total)\n", 
-                source, count, utils::format_size(size)
+                "  {}: {} packages ({} total)\n",
+                source,
+                count,
+                utils::format_size(size)
             ));
         }
-        
+
+        let (file_map_entries, file_map_built) = self.tracker.get_file_map_stats();
+        summary.push_str("\nFile to Package Mapping:\n");
+        summary.push_str(&format!("  Total entries: {}\n", file_map_entries));
+        if file_map_built > 0 {
+            let dt = DateTime::<Local>::from(Utc.timestamp(file_map_built, 0));
+            summary.push_str(&format!("  Built at: {}\n", dt.format("%Y-%m-%d %H:%M:%S")));
+        }
+
         Ok(summary)
     }
 
-    // ============ SAFE REMOVAL ============
-
     pub fn get_safe_to_remove(&self, days_threshold: u32) -> Result<Vec<UnusedPackage>> {
         let all_unused = self.find_unused_with_deps(days_threshold)?;
-        
+
         let safe: Vec<_> = all_unused
             .into_iter()
             .filter(|pkg| {
-                // Don't remove dependencies
                 if pkg.status == PackageStatus::Dependency {
                     return false;
                 }
-                
-                // Don't remove system critical packages
+
                 if self.is_system_critical(&pkg.name) {
                     return false;
                 }
-                
+
                 true
             })
             .collect();
-        
+
         Ok(safe)
     }
 
     fn is_system_critical(&self, package: &str) -> bool {
         let critical = [
-            "bash", "coreutils", "findutils", "grep", "sed", "awk",
-            "tar", "gzip", "xz-utils", "termux-tools", "termux-exec",
-            "termux-keyring", "termux-am", "termux-api",
-            "apk-tools", "apt", "dpkg", "busybox",
-            "ca-certificates", "openssl", "libc++", "libandroid-support",
+            "bash",
+            "coreutils",
+            "findutils",
+            "grep",
+            "sed",
+            "awk",
+            "tar",
+            "gzip",
+            "xz-utils",
+            "termux-tools",
+            "termux-exec",
+            "termux-keyring",
+            "termux-am",
+            "termux-api",
+            "apk-tools",
+            "apt",
+            "dpkg",
+            "busybox",
+            "ca-certificates",
+            "openssl",
+            "libc++",
+            "libandroid-support",
         ];
         critical.contains(&package)
     }
-
-    // ============ COMPARISON ============
 
     pub fn compare(&self, other_list: &[Package]) -> Result<Comparison> {
         let current = self.tracker.get_installed_packages_all()?;
         let current_names: HashSet<String> = current.iter().map(|p| p.name.clone()).collect();
         let other_names: HashSet<String> = other_list.iter().map(|p| p.name.clone()).collect();
-        
+
         let only_current: Vec<_> = current
             .clone()
             .into_iter()
             .filter(|p| !other_names.contains(&p.name))
             .collect();
-        
+
         let only_other: Vec<_> = other_list
             .iter()
             .filter(|p| !current_names.contains(&p.name))
             .cloned()
             .collect();
-        
-        let common: Vec<_> = current_names
-            .intersection(&other_names)
-            .cloned()
-            .collect();
-        
+
+        let common: Vec<_> = current_names.intersection(&other_names).cloned().collect();
+
         let mut version_diffs = Vec::new();
         for name in &common {
             let current_pkg = current.iter().find(|p| &p.name == name);
@@ -340,7 +339,7 @@ impl Analyzer {
                 }
             }
         }
-        
+
         Ok(Comparison {
             only_current,
             only_other,
@@ -349,19 +348,19 @@ impl Analyzer {
         })
     }
 
-    // ============ RISK ANALYSIS ============
-
     pub fn analyze_risk(&self, days_threshold: u32) -> Result<AnalysisResult> {
         let unused = self.find_unused_with_deps(days_threshold)?;
         let mut safe = Vec::new();
         let mut protected = Vec::new();
         let mut system_critical = Vec::new();
         let mut total_savings = 0;
-        
+
         for pkg in unused {
             if pkg.status == PackageStatus::SystemCritical {
                 system_critical.push(pkg.name);
-            } else if pkg.status == PackageStatus::Protected || pkg.status == PackageStatus::Dependency {
+            } else if pkg.status == PackageStatus::Protected
+                || pkg.status == PackageStatus::Dependency
+            {
                 protected.push(pkg);
             } else {
                 if let Some(size) = pkg.size {
@@ -370,7 +369,7 @@ impl Analyzer {
                 safe.push(pkg);
             }
         }
-        
+
         let risk_level = if !system_critical.is_empty() {
             RiskLevel::Critical
         } else if !protected.is_empty() {
@@ -380,7 +379,7 @@ impl Analyzer {
         } else {
             RiskLevel::Low
         };
-        
+
         Ok(AnalysisResult {
             safe_to_remove: safe,
             protected,
@@ -390,15 +389,13 @@ impl Analyzer {
         })
     }
 
-    // ============ DEPENDENCY CHAIN ============
-
     pub fn get_dependency_chain(&self, from: &str, to: &str) -> Result<Vec<String>> {
         let mut visited = HashSet::new();
         let mut path = Vec::new();
         let mut found = Vec::new();
-        
+
         self.find_path(from, to, &mut visited, &mut path, &mut found)?;
-        
+
         if found.is_empty() {
             Err(anyhow!("No path found from {} to {}", from, to))
         } else {
@@ -417,15 +414,15 @@ impl Analyzer {
         if visited.contains(current) || !found.is_empty() {
             return Ok(());
         }
-        
+
         visited.insert(current.to_string());
         path.push(current.to_string());
-        
+
         if current == target {
             found.extend(path.clone());
             return Ok(());
         }
-        
+
         let deps = self.tracker.get_dependencies(current)?;
         for dep in deps {
             self.find_path(&dep, target, visited, path, found)?;
@@ -433,43 +430,50 @@ impl Analyzer {
                 break;
             }
         }
-        
+
         path.pop();
         Ok(())
     }
 
-    // ============ CACHE STATS ============
-
     pub fn get_cache_stats(&self) -> Result<String> {
         let tracker = self.tracker.clone();
         let cache_manager = tracker.cache_manager.clone();
-        
+
         let pkg_stats = cache_manager.get_cache_stats()?;
         let dep_stats = cache_manager.get_dependency_cache_stats()?;
         let usage_stats = cache_manager.get_usage_cache_stats()?;
-        
+        let file_map_stats = cache_manager.get_file_map_cache_stats()?;
+
         let mut output = String::new();
         output.push_str("Cache Statistics\n");
         output.push_str(&format!("{}\n", "=".repeat(40)));
         output.push_str(&format!("Package cache: {}\n", pkg_stats.summary()));
-        
+
         if let Some(stats) = dep_stats {
             output.push_str(&format!("Dependency cache: {}\n", stats.summary()));
         } else {
             output.push_str("Dependency cache: Not built\n");
         }
-        
+
         if let Some(stats) = usage_stats {
             output.push_str(&format!("Usage cache: {}\n", stats.summary()));
         } else {
             output.push_str("Usage cache: Not built\n");
         }
-        
+
+        if let Some(stats) = file_map_stats {
+            output.push_str(&format!("File map cache: {}\n", stats.summary()));
+        } else {
+            output.push_str("File map cache: Not built\n");
+        }
+
         Ok(output)
     }
 
     pub fn rebuild_caches(&self) -> Result<()> {
-        self.tracker.rebuild_caches()
+        self.tracker.rebuild_caches()?;
+        self.tracker.build_file_map_cache()?;
+        Ok(())
     }
 }
 
@@ -484,3 +488,4 @@ pub struct AnalysisReport {
     pub large_unused: Vec<UnusedPackage>,
     pub recommendations: Vec<String>,
 }
+

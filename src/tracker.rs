@@ -1,22 +1,18 @@
-use anyhow::{Result, anyhow};
-use chrono::{DateTime, Local, Utc, TimeZone};
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use parking_lot::RwLock;
 use serde_json;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{BufReader, BufRead},
+    io::{BufRead, BufReader},
     path::PathBuf,
     process::Command,
     sync::Arc,
 };
 
 use crate::{
-    config::Config,
-    models::*,
-    scanner::PackageScanner,
-    cache::CacheManager,
-    logger::Logger,
+    cache::CacheManager, config::Config, logger::Logger, models::*, scanner::PackageScanner, utils,
 };
 
 #[derive(Clone)]
@@ -25,10 +21,9 @@ pub struct Tracker {
     cache: Arc<RwLock<HashMap<String, Package>>>,
     pub cache_manager: CacheManager,
     logger: Logger,
-    // Performance caches
     dependency_cache: Arc<RwLock<DependencyCache>>,
     usage_cache: Arc<RwLock<UsageCache>>,
-    // Track when caches were last rebuilt
+    file_map_cache: Arc<RwLock<FileMapCache>>,
     last_rebuild: Arc<RwLock<i64>>,
 }
 
@@ -37,24 +32,24 @@ impl Tracker {
         let config_arc = Arc::new(config);
         let cache_manager = CacheManager::new(config_arc.clone())?;
         let logger = Logger::new(config_arc.clone())?;
-        
+
         let tracker = Self {
             config: config_arc.clone(),
             cache: Arc::new(RwLock::new(HashMap::new())),
-            cache_manager,
+            cache_manager: cache_manager.clone(),
             logger,
             dependency_cache: Arc::new(RwLock::new(DependencyCache::new())),
             usage_cache: Arc::new(RwLock::new(UsageCache::new())),
+            file_map_cache: Arc::new(RwLock::new(FileMapCache::new())),
             last_rebuild: Arc::new(RwLock::new(0)),
         };
-        
+
         tracker.load_cache()?;
-        tracker.rebuild_caches()?; // Build initial caches
-        
+        tracker.rebuild_caches()?;
+        tracker.load_file_map_cache()?;
+
         Ok(tracker)
     }
-
-    // ============ CACHE MANAGEMENT ============
 
     fn load_cache(&self) -> Result<()> {
         let packages = self.cache_manager.get_all();
@@ -72,30 +67,27 @@ impl Tracker {
         Ok(())
     }
 
-    /// Rebuild all performance caches
     pub fn rebuild_caches(&self) -> Result<()> {
         let start = std::time::Instant::now();
-        
-        // Load usage cache from log file
+
         let usage_cache = self.build_usage_cache()?;
         *self.usage_cache.write() = usage_cache;
-        
-        // Build dependency cache
+
         let dep_cache = self.build_dependency_cache()?;
         *self.dependency_cache.write() = dep_cache;
-        
-        // Update rebuild timestamp
+
         *self.last_rebuild.write() = Utc::now().timestamp();
-        
+
         let duration = start.elapsed();
-        self.logger.info(&format!("Caches rebuilt in {:?}", duration))?;
-        
+        self.logger
+            .info(&format!("Caches rebuilt in {:?}", duration))?;
+
         Ok(())
     }
 
     fn build_usage_cache(&self) -> Result<UsageCache> {
         let mut cache = UsageCache::new();
-        
+
         if !self.config.log_file.exists() {
             return Ok(cache);
         }
@@ -111,7 +103,10 @@ impl Tracker {
                 if let Ok(event) = serde_json::from_str::<PackageEvent>(&line) {
                     let idx = events.len();
                     events.push(event.clone());
-                    package_index.entry(event.package.clone()).or_default().push(idx);
+                    package_index
+                        .entry(event.package.clone())
+                        .or_default()
+                        .push(idx);
                     if event.timestamp > last_timestamp {
                         last_timestamp = event.timestamp;
                     }
@@ -128,42 +123,36 @@ impl Tracker {
         Ok(cache)
     }
 
-    /// Build dependency cache using BATCH pkg show - ONE subprocess call for ALL packages
     fn build_dependency_cache(&self) -> Result<DependencyCache> {
         use indicatif::{ProgressBar, ProgressStyle};
-        
+
         let packages = self.get_installed_packages_all()?;
         let mut cache = DependencyCache::new();
-        
+
         if packages.is_empty() {
             return Ok(cache);
         }
 
-        // Create progress bar
         let pb = ProgressBar::new(packages.len() as u64);
         pb.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} packages ({eta})")
             .unwrap()
             .progress_chars("#>-"));
-        
+
         pb.set_message("Fetching dependencies");
 
-        // Get all package names for batch query
         let pkg_names: Vec<&str> = packages.iter().map(|p| p.name.as_str()).collect();
-        
-        // ONE subprocess call for ALL packages
         let deps_map = self.get_dependencies_batch(&pkg_names)?;
-        
-        // Build cache from batch results
-        for (i, pkg) in packages.iter().enumerate() {
+
+        for (_i, pkg) in packages.iter().enumerate() {
             pb.inc(1);
-            
+
             let deps = deps_map.get(&pkg.name).cloned().unwrap_or_default();
             cache.direct_deps.insert(pkg.name.clone(), deps.clone());
-            
-            // Build reverse dependencies
+
             for dep in deps {
-                cache.reverse_deps
+                cache
+                    .reverse_deps
                     .entry(dep)
                     .or_insert_with(Vec::new)
                     .push(pkg.name.clone());
@@ -174,54 +163,51 @@ impl Tracker {
 
         cache.built_at = Utc::now().timestamp();
         cache.package_count = packages.len();
-        cache.max_depth = 0; // Skip depth calc for speed (can be calculated on demand)
-        
+        cache.max_depth = 0;
+
         Ok(cache)
     }
 
-    /// Batch get dependencies for multiple packages in ONE subprocess call
     fn get_dependencies_batch(&self, packages: &[&str]) -> Result<HashMap<String, Vec<String>>> {
         if packages.is_empty() {
             return Ok(HashMap::new());
         }
-        
-        // Build command: pkg show pkg1 pkg2 pkg3 ...
+
         let mut cmd = Command::new("pkg");
         cmd.arg("show");
         for pkg in packages {
             cmd.arg(pkg);
         }
-        
+
         let output = match cmd.output() {
             Ok(o) => o,
             Err(e) => {
-                // Fallback: process one by one if batch fails
-                self.logger.warning(&format!("Batch pkg show failed, falling back to individual: {}", e))?;
+                self.logger.warning(&format!(
+                    "Batch pkg show failed, falling back to individual: {}",
+                    e
+                ))?;
                 return self.get_dependencies_batch_fallback(packages);
             }
         };
-        
+
         if !output.status.success() {
-            // Fallback: process one by one if batch fails
-            self.logger.warning("Batch pkg show returned non-zero, falling back to individual")?;
+            self.logger
+                .warning("Batch pkg show returned non-zero, falling back to individual")?;
             return self.get_dependencies_batch_fallback(packages);
         }
-        
+
         let stdout = String::from_utf8(output.stdout)?;
         let mut results = HashMap::new();
         let mut current_pkg: Option<String> = None;
         let mut current_deps: Vec<String> = Vec::new();
         let mut in_deps = false;
-        
+
         for line in stdout.lines() {
-            // Package header line: "Package: pkgname"
             if line.starts_with("Package:") {
-                // Save previous package
                 if let Some(name) = current_pkg.take() {
                     results.insert(name, current_deps.clone());
                     current_deps.clear();
                 }
-                // Start new package
                 let name = line.trim_start_matches("Package:").trim().to_string();
                 current_pkg = Some(name);
                 in_deps = false;
@@ -231,7 +217,12 @@ impl Tracker {
                 if parts.len() > 1 {
                     let dep_list = parts[1].trim();
                     for dep in dep_list.split(',') {
-                        let clean = dep.trim().split_whitespace().next().unwrap_or("").to_string();
+                        let clean = dep
+                            .trim()
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
                         if !clean.is_empty() {
                             current_deps.push(clean);
                         }
@@ -239,7 +230,12 @@ impl Tracker {
                 }
             } else if in_deps && line.starts_with(' ') {
                 for dep in line.trim().split(',') {
-                    let clean = dep.trim().split_whitespace().next().unwrap_or("").to_string();
+                    let clean = dep
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
                     if !clean.is_empty() {
                         current_deps.push(clean);
                     }
@@ -248,27 +244,28 @@ impl Tracker {
                 in_deps = false;
             }
         }
-        
-        // Save last package
+
         if let Some(name) = current_pkg {
             results.insert(name, current_deps);
         }
-        
+
         Ok(results)
     }
 
-    /// Fallback: process one by one if batch fails
-    fn get_dependencies_batch_fallback(&self, packages: &[&str]) -> Result<HashMap<String, Vec<String>>> {
+    fn get_dependencies_batch_fallback(
+        &self,
+        packages: &[&str],
+    ) -> Result<HashMap<String, Vec<String>>> {
         use indicatif::{ProgressBar, ProgressStyle};
-        
+
         let pb = ProgressBar::new(packages.len() as u64);
         pb.set_style(ProgressStyle::default_bar()
             .template("{spinner:.yellow} [{elapsed_precise}] [{bar:40.yellow/blue}] {pos}/{len} packages (fallback)")
             .unwrap()
             .progress_chars("#>-"));
-        
+
         pb.set_message("Fetching dependencies (individual fallback)");
-        
+
         let mut results = HashMap::new();
         for pkg in packages {
             pb.inc(1);
@@ -276,110 +273,25 @@ impl Tracker {
                 results.insert(pkg.to_string(), deps);
             }
         }
-        
+
         pb.finish_with_message("Fallback complete");
         Ok(results)
     }
 
-    /// Safe version that returns empty vec on error instead of failing
     fn get_dependencies_from_system_safe(&self, package: &str) -> Result<Vec<String>> {
         match self.get_dependencies_from_system(package) {
             Ok(deps) => Ok(deps),
             Err(e) => {
-                // Log warning but continue with empty deps
-                let _ = self.logger.warning(&format!("Failed to get deps for {}: {}", package, e));
-                Ok(Vec::new()) // Return empty deps instead of error
+                let _ = self
+                    .logger
+                    .warning(&format!("Failed to get deps for {}: {}", package, e));
+                Ok(Vec::new())
             }
         }
-    }
-
-    fn calculate_depth(&self, package: &str, deps: &HashMap<String, Vec<String>>, current_depth: usize, visited: &mut HashSet<String>) -> usize {
-        if visited.contains(package) {
-            return current_depth;
-        }
-        visited.insert(package.to_string());
-
-        if let Some(dep_list) = deps.get(package) {
-            let mut max_child_depth = current_depth;
-            for dep in dep_list {
-                let child_depth = self.calculate_depth(dep, deps, current_depth + 1, visited);
-                if child_depth > max_child_depth {
-                    max_child_depth = child_depth;
-                }
-            }
-            max_child_depth
-        } else {
-            current_depth
-        }
-    }
-
-    // ============ PACKAGE SCANNING ============
-
-    pub fn scan_all_packages(&self, force: bool) -> Result<Vec<Package>> {
-        if !force && self.cache_manager.is_fresh()? {
-            // Return cached packages without rescanning
-            return Ok(self.cache.read().values().cloned().collect());
-        }
-
-        self.logger.info("Starting package scan")?;
-        let packages = PackageScanner::scan_all(self.config.clone())?;
-        let packages_vec: Vec<Package> = packages.into_iter().collect();
-
-        self.cache_manager.save(&packages_vec)?;
-        
-        let mut cache = self.cache.write();
-        cache.clear();
-        for pkg in &packages_vec {
-            cache.insert(pkg.name.clone(), pkg.clone());
-        }
-        drop(cache);
-
-        // Rebuild caches after scan
-        self.rebuild_caches()?;
-
-        self.logger.info(&format!("Scan complete: {} packages found", packages_vec.len()))?;
-        Ok(packages_vec)
-    }
-
-    pub fn get_installed_packages_all(&self) -> Result<Vec<Package>> {
-        // Try cache first
-        let cache = self.cache.read();
-        if !cache.is_empty() {
-            return Ok(cache.values().cloned().collect());
-        }
-        drop(cache);
-        
-        // Fallback to scan
-        self.scan_all_packages(false)
-    }
-
-    // ============ DEPENDENCY RESOLUTION (CACHED) ============
-
-    /// Get dependencies for a package - uses cache when possible
-    pub fn get_dependencies(&self, package: &str) -> Result<Vec<String>> {
-        // Check cache first
-        let dep_cache = self.dependency_cache.read();
-        if let Some(deps) = dep_cache.get_deps(package) {
-            return Ok(deps.clone());
-        }
-        drop(dep_cache);
-
-        // Fallback to system query (safe version)
-        let deps = self.get_dependencies_from_system_safe(package)?;
-        
-        // Update cache
-        let mut dep_cache = self.dependency_cache.write();
-        dep_cache.direct_deps.insert(package.to_string(), deps.clone());
-        drop(dep_cache);
-        
-        Ok(deps)
     }
 
     fn get_dependencies_from_system(&self, package: &str) -> Result<Vec<String>> {
-        let output = Command::new("pkg")
-            .arg("show")
-            .arg(package)
-            .output();
+        let output = Command::new("pkg").arg("show").arg(package).output();
 
         if let Err(e) = output {
             return Err(anyhow!("Failed to run pkg show for {}: {}", package, e));
@@ -402,7 +314,12 @@ impl Tracker {
                 if parts.len() > 1 {
                     let dep_list = parts[1].trim();
                     for dep in dep_list.split(',') {
-                        let clean = dep.trim().split_whitespace().next().unwrap_or("").to_string();
+                        let clean = dep
+                            .trim()
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
                         if !clean.is_empty() {
                             deps.push(clean);
                         }
@@ -410,7 +327,12 @@ impl Tracker {
                 }
             } else if in_deps && line.starts_with(' ') {
                 for dep in line.trim().split(',') {
-                    let clean = dep.trim().split_whitespace().next().unwrap_or("").to_string();
+                    let clean = dep
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
                     if !clean.is_empty() {
                         deps.push(clean);
                     }
@@ -423,7 +345,121 @@ impl Tracker {
         Ok(deps)
     }
 
-    /// Get reverse dependencies - uses cache when possible
+    fn load_file_map_cache(&self) -> Result<()> {
+        let db_mtime = utils::get_dpkg_db_mtime();
+
+        if let Ok(Some(cache)) = self.cache_manager.load_file_map_cache() {
+            if let Some(mtime) = db_mtime {
+                if let Ok(mtime_secs) = mtime.elapsed() {
+                    let cache_age = Utc::now().timestamp() - cache.built_at;
+                    if cache_age < mtime_secs.as_secs() as i64 {
+                        let mut file_map = self.file_map_cache.write();
+                        *file_map = cache;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let age = Utc::now().timestamp() - cache.built_at;
+            if age < 86400 {
+                let mut file_map = self.file_map_cache.write();
+                *file_map = cache;
+                return Ok(());
+            }
+        }
+
+        self.build_file_map_cache()
+    }
+
+    pub fn build_file_map_cache(&self) -> Result<()> {
+        self.logger.info("Building file to package mapping...")?;
+
+        let mapping = utils::build_file_package_map()?;
+        let total_entries = mapping.len();
+
+        let cache = FileMapCache {
+            mapping,
+            built_at: Utc::now().timestamp(),
+            total_entries,
+        };
+
+        self.cache_manager.save_file_map_cache(&cache)?;
+
+        let mut file_map = self.file_map_cache.write();
+        *file_map = cache;
+
+        self.logger.info(&format!(
+            "File to package map built: {} entries",
+            total_entries
+        ))?;
+        Ok(())
+    }
+
+    fn resolve_filename_to_package(&self, filename: &str) -> Option<String> {
+        let file_map = self.file_map_cache.read();
+        file_map.get_package_for_file(filename)
+    }
+
+    pub fn scan_all_packages(&self, force: bool) -> Result<Vec<Package>> {
+        if !force && self.cache_manager.is_fresh()? {
+            return Ok(self.cache.read().values().cloned().collect());
+        }
+
+        self.logger.info("Starting package scan")?;
+        let packages = PackageScanner::scan_all(self.config.clone())?;
+        let packages_vec: Vec<Package> = packages.into_iter().collect();
+
+        self.cache_manager.save(&packages_vec)?;
+
+        let mut cache = self.cache.write();
+        cache.clear();
+        for pkg in &packages_vec {
+            cache.insert(pkg.name.clone(), pkg.clone());
+        }
+        drop(cache);
+
+        self.rebuild_caches()?;
+        self.build_file_map_cache()?;
+
+        self.logger.info(&format!(
+            "Scan complete: {} packages found",
+            packages_vec.len()
+        ))?;
+        Ok(packages_vec)
+    }
+
+    pub fn get_installed_packages_all(&self) -> Result<Vec<Package>> {
+        let cache = self.cache.read();
+        if !cache.is_empty() {
+            return Ok(cache.values().cloned().collect());
+        }
+        drop(cache);
+
+        self.scan_all_packages(false)
+    }
+
+    pub fn get_dependencies(&self, package: &str) -> Result<Vec<String>> {
+        let pkg_name = if let Some(resolved) = self.resolve_filename_to_package(package) {
+            resolved
+        } else {
+            package.to_string()
+        };
+
+        let dep_cache = self.dependency_cache.read();
+        if let Some(deps) = dep_cache.get_deps(&pkg_name) {
+            return Ok(deps.clone());
+        }
+        drop(dep_cache);
+
+        let deps = self.get_dependencies_from_system_safe(&pkg_name)?;
+
+        let mut dep_cache = self.dependency_cache.write();
+        dep_cache.direct_deps.insert(pkg_name, deps.clone());
+        drop(dep_cache);
+
+        Ok(deps)
+    }
+
     pub fn get_reverse_dependencies(&self, package: &str) -> Result<Vec<String>> {
         let dep_cache = self.dependency_cache.read();
         if let Some(reverse) = dep_cache.get_reverse_deps(package) {
@@ -431,7 +467,6 @@ impl Tracker {
         }
         drop(dep_cache);
 
-        // Fallback: expensive O(n²) scan - but this should rarely happen
         let all_packages = self.get_installed_packages_all()?;
         let mut reverse_deps = Vec::new();
 
@@ -443,15 +478,15 @@ impl Tracker {
             }
         }
 
-        // Cache the result
         let mut dep_cache = self.dependency_cache.write();
-        dep_cache.reverse_deps.insert(package.to_string(), reverse_deps.clone());
+        dep_cache
+            .reverse_deps
+            .insert(package.to_string(), reverse_deps.clone());
         drop(dep_cache);
 
         Ok(reverse_deps)
     }
 
-    /// Get all dependencies recursively for a set of packages
     pub fn get_all_dependencies(&self, packages: &[String]) -> Result<HashSet<String>> {
         let mut all_deps = HashSet::new();
         let mut to_process: Vec<String> = packages.to_vec();
@@ -482,9 +517,6 @@ impl Tracker {
         Ok(all_deps)
     }
 
-    // ============ USAGE TRACKING (CACHED) ============
-
-    /// Get all used packages - uses cache
     pub fn get_used_packages(&self) -> Result<HashSet<String>> {
         let usage_cache = self.usage_cache.read();
         if !usage_cache.is_empty() {
@@ -492,7 +524,6 @@ impl Tracker {
         }
         drop(usage_cache);
 
-        // Fallback: scan log file
         let mut used = HashSet::new();
         if self.config.log_file.exists() {
             let file = File::open(&self.config.log_file)?;
@@ -514,19 +545,21 @@ impl Tracker {
     fn get_install_date_from_cache(&self, package: &str) -> Option<String> {
         let usage_cache = self.usage_cache.read();
         if let Some(timestamp) = usage_cache.get_install_time(package) {
-            let dt = DateTime::<Local>::from(Utc.timestamp_opt(timestamp, 0).unwrap());
-            return Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+            let dt = DateTime::<Local>::from(Utc.timestamp(timestamp, 0));
+            Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        } else {
+            None
         }
-        None
     }
 
     fn get_last_used_date_from_cache(&self, package: &str) -> Option<String> {
         let usage_cache = self.usage_cache.read();
         if let Some(timestamp) = usage_cache.get_last_use(package) {
-            let dt = DateTime::<Local>::from(Utc.timestamp_opt(timestamp, 0).unwrap());
-            return Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+            let dt = DateTime::<Local>::from(Utc.timestamp(timestamp, 0));
+            Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        } else {
+            None
         }
-        None
     }
 
     fn get_usage_count_from_cache(&self, package: &str) -> Option<u64> {
@@ -538,8 +571,6 @@ impl Tracker {
             None
         }
     }
-
-    // ============ PACKAGE INFORMATION ============
 
     pub fn get_package_info(&self, package: &str) -> Result<PackageInfo> {
         let installed = self.get_installed_packages_all()?;
@@ -571,8 +602,6 @@ impl Tracker {
         })
     }
 
-    // ============ FINDING UNUSED PACKAGES ============
-
     pub fn find_unused(&self, days_threshold: u32) -> Result<Vec<UnusedPackage>> {
         let installed = self.get_installed_packages_all()?;
         let core_packages = Self::get_core_packages();
@@ -601,7 +630,6 @@ impl Tracker {
                     continue;
                 }
             } else {
-                // Never used - count as unused if threshold is 0 or package is old
                 if days_threshold == 0 {
                     0
                 } else {
@@ -649,7 +677,10 @@ impl Tracker {
         let used_packages = self.get_used_packages()?;
 
         if used_packages.contains(package) {
-            return Ok(format!("Package '{}' is directly used (you installed it)", package));
+            return Ok(format!(
+                "Package '{}' is directly used (you installed it)",
+                package
+            ));
         }
 
         if Self::get_core_packages().contains(&package) && self.config.protect_core {
@@ -663,17 +694,21 @@ impl Tracker {
             for used_pkg in &used_packages {
                 if let Ok(pkg_deps) = self.get_dependencies(used_pkg) {
                     if pkg_deps.contains(&package.to_string()) {
-                        return Ok(format!("Package '{}' is a dependency of '{}'", package, used_pkg));
+                        return Ok(format!(
+                            "Package '{}' is a dependency of '{}'",
+                            package, used_pkg
+                        ));
                     }
                 }
             }
-            return Ok(format!("Package '{}' is a dependency of used packages", package));
+            return Ok(format!(
+                "Package '{}' is a dependency of used packages",
+                package
+            ));
         }
 
         Ok(format!("Package '{}' is not protected", package))
     }
-
-    // ============ PACKAGE MANAGEMENT ============
 
     pub fn remove_package(&self, unused_pkg: &UnusedPackage) -> Result<()> {
         if self.config.backup_before_remove {
@@ -702,11 +737,12 @@ impl Tracker {
                     cache.remove(&unused_pkg.name);
                     drop(cache);
                     self.save_cache()?;
-                    
-                    // Rebuild caches after removal
-                    self.rebuild_caches()?;
 
-                    self.logger.info(&format!("Removed package: {}", unused_pkg.name))?;
+                    self.rebuild_caches()?;
+                    self.build_file_map_cache()?;
+
+                    self.logger
+                        .info(&format!("Removed package: {}", unused_pkg.name))?;
                     Ok(())
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -736,11 +772,12 @@ impl Tracker {
                 cache.remove(&unused_pkg.name);
                 drop(cache);
                 self.save_cache()?;
-                
-                // Rebuild caches after removal
-                self.rebuild_caches()?;
 
-                self.logger.info(&format!("Removed package: {}", unused_pkg.name))?;
+                self.rebuild_caches()?;
+                self.build_file_map_cache()?;
+
+                self.logger
+                    .info(&format!("Removed package: {}", unused_pkg.name))?;
                 Ok(())
             }
         }
@@ -769,20 +806,22 @@ impl Tracker {
                     cache.insert(package.name.clone(), package.clone());
                     drop(cache);
                     self.save_cache()?;
-                    
-                    // Rebuild caches after installation
-                    self.rebuild_caches()?;
 
-                    self.logger.info(&format!("Installed package: {}", package.name))?;
+                    self.rebuild_caches()?;
+                    self.build_file_map_cache()?;
+
+                    self.logger
+                        .info(&format!("Installed package: {}", package.name))?;
                     Ok(())
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     Err(anyhow!("Failed to install package: {}", stderr))
                 }
             }
-            _ => {
-                Err(anyhow!("Cannot automatically install {} packages", package.source))
-            }
+            _ => Err(anyhow!(
+                "Cannot automatically install {} packages",
+                package.source
+            )),
         }
     }
 
@@ -792,18 +831,30 @@ impl Tracker {
         drop(cache);
         self.save_cache()?;
         self.rebuild_caches()?;
-        self.logger.info(&format!("Removed {} from cache", package))?;
+        self.build_file_map_cache()?;
+        self.logger
+            .info(&format!("Removed {} from cache", package))?;
         Ok(())
     }
 
     pub fn print_dependency_tree(&self, package: &str, max_depth: usize) -> Result<()> {
         let deps = self.get_dependencies(package)?;
-        println!("Dependency tree for '{}' (max depth: {}):", package, max_depth);
+        println!(
+            "Dependency tree for '{}' (max depth: {}):",
+            package, max_depth
+        );
         self.print_tree(package, &deps, 0, max_depth, &mut HashSet::new())?;
         Ok(())
     }
 
-    fn print_tree(&self, _package: &str, deps: &[String], indent: usize, max_depth: usize, visited: &mut HashSet<String>) -> Result<()> {
+    fn print_tree(
+        &self,
+        _package: &str,
+        deps: &[String],
+        indent: usize,
+        max_depth: usize,
+        visited: &mut HashSet<String>,
+    ) -> Result<()> {
         if indent >= max_depth {
             println!("{}... (depth limit reached)", "  ".repeat(indent));
             return Ok(());
@@ -826,7 +877,14 @@ impl Tracker {
                 visited.insert(dep.clone());
                 if let Ok(sub_deps) = self.get_dependencies(dep) {
                     if !sub_deps.is_empty() {
-                        self.print_tree_with_vertical(dep, &sub_deps, indent + 1, max_depth, visited, is_last)?;
+                        self.print_tree_with_vertical(
+                            dep,
+                            &sub_deps,
+                            indent + 1,
+                            max_depth,
+                            visited,
+                            is_last,
+                        )?;
                     }
                 }
                 visited.remove(dep);
@@ -836,7 +894,15 @@ impl Tracker {
         Ok(())
     }
 
-    fn print_tree_with_vertical(&self, _package: &str, deps: &[String], indent: usize, max_depth: usize, visited: &mut HashSet<String>, parent_is_last: bool) -> Result<()> {
+    fn print_tree_with_vertical(
+        &self,
+        _package: &str,
+        deps: &[String],
+        indent: usize,
+        max_depth: usize,
+        visited: &mut HashSet<String>,
+        parent_is_last: bool,
+    ) -> Result<()> {
         if indent >= max_depth {
             println!("{}... (depth limit reached)", "  ".repeat(indent));
             return Ok(());
@@ -844,19 +910,30 @@ impl Tracker {
 
         let prefix = if parent_is_last { "    " } else { "│   " };
         let full_prefix = "  ".repeat(indent) + prefix;
-        
+
         for (i, dep) in deps.iter().enumerate() {
             let is_last = i == deps.len() - 1;
             let connector = if is_last { "└── " } else { "├── " };
-            let status = if visited.contains(dep) { " [cycle]" } else { "" };
-            
+            let status = if visited.contains(dep) {
+                " [cycle]"
+            } else {
+                ""
+            };
+
             println!("{}{}{}{}", full_prefix, connector, dep, status);
-            
+
             if !visited.contains(dep) {
                 visited.insert(dep.clone());
                 if let Ok(sub_deps) = self.get_dependencies(dep) {
                     if !sub_deps.is_empty() {
-                        self.print_tree_with_vertical(dep, &sub_deps, indent + 1, max_depth, visited, is_last)?;
+                        self.print_tree_with_vertical(
+                            dep,
+                            &sub_deps,
+                            indent + 1,
+                            max_depth,
+                            visited,
+                            is_last,
+                        )?;
                     }
                 }
                 visited.remove(dep);
@@ -864,8 +941,6 @@ impl Tracker {
         }
         Ok(())
     }
-
-    // ============ STATISTICS ============
 
     pub fn get_stats(&self) -> Result<Stats> {
         let packages = self.get_installed_packages_all()?;
@@ -889,11 +964,19 @@ impl Tracker {
         let largest_packages = largest.into_iter().take(10).collect();
 
         let mut oldest = packages.clone();
-        oldest.sort_by(|a, b| a.installed_date.unwrap_or(0).cmp(&b.installed_date.unwrap_or(0)));
+        oldest.sort_by(|a, b| {
+            a.installed_date
+                .unwrap_or(0)
+                .cmp(&b.installed_date.unwrap_or(0))
+        });
         let oldest_packages = oldest.into_iter().take(10).collect();
 
         let mut newest = packages.clone();
-        newest.sort_by(|a, b| b.installed_date.unwrap_or(0).cmp(&a.installed_date.unwrap_or(0)));
+        newest.sort_by(|a, b| {
+            b.installed_date
+                .unwrap_or(0)
+                .cmp(&a.installed_date.unwrap_or(0))
+        });
         let newest_packages = newest.into_iter().take(10).collect();
 
         let avg_size = if !packages.is_empty() {
@@ -903,10 +986,14 @@ impl Tracker {
         };
 
         let usage_cache = self.usage_cache.read();
-        let total_install_events = usage_cache.events.iter()
+        let total_install_events = usage_cache
+            .events
+            .iter()
             .filter(|e| e.action == "INSTALL")
             .count();
-        let total_remove_events = usage_cache.events.iter()
+        let total_remove_events = usage_cache
+            .events
+            .iter()
             .filter(|e| e.action == "REMOVE")
             .count();
 
@@ -924,8 +1011,6 @@ impl Tracker {
             total_remove_events,
         })
     }
-
-    // ============ UTILITY FUNCTIONS ============
 
     pub fn log_event(&self, event: &PackageEvent) -> Result<()> {
         self.logger.log_event(event)
@@ -948,9 +1033,14 @@ impl Tracker {
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    self.logger.warning(&format!("Backup failed for {}: {}", pkg.name, stderr))?;
+                    self.logger
+                        .warning(&format!("Backup failed for {}: {}", pkg.name, stderr))?;
                 } else {
-                    self.logger.info(&format!("Backed up {} to {}", pkg.name, backup_path.display()))?;
+                    self.logger.info(&format!(
+                        "Backed up {} to {}",
+                        pkg.name,
+                        backup_path.display()
+                    ))?;
                 }
             }
         }
@@ -997,12 +1087,17 @@ impl Tracker {
             logger: self.logger.clone(),
             dependency_cache: self.dependency_cache.clone(),
             usage_cache: self.usage_cache.clone(),
+            file_map_cache: self.file_map_cache.clone(),
             last_rebuild: self.last_rebuild.clone(),
         }
     }
 
-    // Getter for cache_manager
     pub fn get_cache_manager(&self) -> CacheManager {
         self.cache_manager.clone()
+    }
+
+    pub fn get_file_map_stats(&self) -> (usize, i64) {
+        let file_map = self.file_map_cache.read();
+        (file_map.total_entries, file_map.built_at)
     }
 }

@@ -1,94 +1,97 @@
-use std::{
-    collections::HashSet,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
-    process::Command,
-    sync::Arc,
-    time::SystemTime,
-};
-
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use serde_json;
+use std::{
+    collections::HashSet, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, sync::Arc,
+    time::SystemTime,
+};
 use walkdir::WalkDir;
 use which::which;
 
 use crate::{
-    models::*,
     config::Config,
+    models::{Package, PackageSource},
     utils,
 };
 
 pub struct PackageScanner;
 
 impl PackageScanner {
-    // ============ MAIN SCAN ENTRY POINT ============
+    pub fn scan_all(config: Arc<Config>) -> Result<HashSet<Package>> {
+        use indicatif::{ProgressBar, ProgressStyle};
 
-  pub fn scan_all(config: Arc<Config>) -> Result<HashSet<Package>> {
-    use indicatif::{ProgressBar, ProgressStyle};
-    
-    let mut all_packages = HashSet::new();
-    let scan_dirs = config.get_scan_dirs();
-    let exclude_patterns = config.get_exclude_patterns();
+        let mut all_packages = HashSet::new();
+        let scan_dirs = config.get_scan_dirs();
+        let exclude_patterns = config.get_exclude_patterns();
 
-    // Progress bar for scanning sources
-    let pb = ProgressBar::new(6);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} sources")
-        .unwrap()
-        .progress_chars("#>-"));
-    
-    pb.set_message("Scanning package sources");
+        let pb = ProgressBar::new(6);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} sources",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
 
-    let sources = vec![
-        ("pkg", Self::scan_pkg_if_needed(Self::get_pkg_db_modified(), Self::is_cache_fresh(&config))),
-        ("cargo", Self::scan_cargo()),
-        ("pip", Self::scan_pip()),
-        ("npm", Self::scan_npm()),
-        ("gem", Self::scan_gem()),
-        ("manual", Self::scan_manual(scan_dirs, exclude_patterns)),
-    ];
+        pb.set_message("Scanning package sources");
 
-    let results: Vec<_> = sources
-        .into_par_iter()
-        .map(|(name, result)| {
-            pb.inc(1);
-            pb.set_message(format!("Scanning {}", name));
-            (name, result)
-        })
-        .collect();
+        let sources = vec![
+            (
+                "pkg",
+                Self::scan_pkg_if_needed(
+                    Self::get_pkg_db_modified(),
+                    Self::is_cache_fresh(&config),
+                ),
+            ),
+            ("cargo", Self::scan_cargo()),
+            ("pip", Self::scan_pip()),
+            ("npm", Self::scan_npm()),
+            ("gem", Self::scan_gem()),
+            ("manual", Self::scan_manual(scan_dirs, exclude_patterns)),
+        ];
 
-    for (name, result) in results {
-        if let Ok(packages) = result {
-            let count = packages.len();
-            all_packages.extend(packages);
-            pb.println(format!("✓ {}: {} packages", name, count));
+        let results: Vec<_> = sources
+            .into_par_iter()
+            .map(|(name, result)| {
+                pb.inc(1);
+                pb.set_message(format!("Scanning {}", name));
+                (name, result)
+            })
+            .collect();
+
+        for (name, result) in results {
+            if let Ok(packages) = result {
+                let count = packages.len();
+                all_packages.extend(packages);
+                pb.println(format!("✓ {}: {} packages", name, count));
+            }
         }
+
+        pb.finish_with_message("Scan complete");
+
+        let pb2 = ProgressBar::new(2);
+        pb2.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} steps",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        pb2.set_message("Merging duplicates");
+        Self::merge_duplicates(&mut all_packages);
+        pb2.inc(1);
+
+        pb2.set_message("Enriching package info");
+        Self::enrich_package_info(&mut all_packages)?;
+        pb2.inc(1);
+
+        pb2.finish_with_message("Ready");
+
+        Ok(all_packages)
     }
-
-    pb.finish_with_message("Scan complete");
-
-    // Progress for post-processing
-    let pb2 = ProgressBar::new(2);
-    pb2.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} steps")
-        .unwrap()
-        .progress_chars("#>-"));
-    
-    pb2.set_message("Merging duplicates");
-    Self::merge_duplicates(&mut all_packages);
-    pb2.inc(1);
-    
-    pb2.set_message("Enriching package info");
-    Self::enrich_package_info(&mut all_packages)?;
-    pb2.inc(1);
-    
-    pb2.finish_with_message("Ready");
-
-    Ok(all_packages)
-}
-
-    // ============ SMART PKG SCANNING ============
 
     fn get_pkg_db_modified() -> Option<SystemTime> {
         let db_paths = [
@@ -111,12 +114,10 @@ impl PackageScanner {
     }
 
     fn is_cache_fresh(config: &Config) -> bool {
-        // Check if package cache exists and is recent
         let cache_file = config.db_file.join("packages.db.json");
         if let Ok(metadata) = std::fs::metadata(&cache_file) {
             if let Ok(modified) = metadata.modified() {
                 if let Ok(elapsed) = modified.elapsed() {
-                    // Cache is fresh if less than 1 hour old
                     return elapsed.as_secs() < 3600;
                 }
             }
@@ -124,14 +125,15 @@ impl PackageScanner {
         false
     }
 
-    fn scan_pkg_if_needed(db_modified: Option<SystemTime>, cache_fresh: bool) -> Result<HashSet<Package>> {
-        // If cache is fresh and database hasn't changed, skip scan
+    fn scan_pkg_if_needed(
+        db_modified: Option<SystemTime>,
+        cache_fresh: bool,
+    ) -> Result<HashSet<Package>> {
         if cache_fresh {
             if let Some(db_time) = db_modified {
                 if let Ok(cache_meta) = std::fs::metadata("packages.db.json") {
                     if let Ok(cache_time) = cache_meta.modified() {
                         if cache_time > db_time {
-                            // Cache is newer than database, skip scan
                             return Ok(HashSet::new());
                         }
                     }
@@ -142,14 +144,10 @@ impl PackageScanner {
         Self::scan_pkg()
     }
 
-    // ============ PKG SCANNER ============
-
     fn scan_pkg() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
 
-        let output = Command::new("pkg")
-            .arg("list-installed")
-            .output();
+        let output = Command::new("pkg").arg("list-installed").output();
 
         if let Err(e) = output {
             return Err(anyhow!("Failed to run pkg list-installed: {}", e));
@@ -167,10 +165,8 @@ impl PackageScanner {
                 let name = parts[0].to_string();
                 let version = parts[1].to_string();
 
-                let install_path = PathBuf::from(format!(
-                    "/data/data/com.termux/files/usr/{}",
-                    name
-                ));
+                let install_path =
+                    PathBuf::from(format!("/data/data/com.termux/files/usr/bin/{}", name));
 
                 packages.insert(Package {
                     name,
@@ -187,10 +183,44 @@ impl PackageScanner {
             }
         }
 
+        let dpkg_output = Command::new("dpkg").arg("-l").output()?;
+
+        if dpkg_output.status.success() {
+            let stdout = String::from_utf8(dpkg_output.stdout)?;
+            for line in stdout.lines() {
+                if line.starts_with("ii") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let name = parts[1].to_string();
+
+                        let exists = packages.iter().any(|p| p.name == name);
+                        if !exists {
+                            let version = parts.get(2).map(|v| v.to_string());
+                            let install_path = PathBuf::from(format!(
+                                "/data/data/com.termux/files/usr/bin/{}",
+                                name
+                            ));
+
+                            packages.insert(Package {
+                                name,
+                                version,
+                                source: PackageSource::Pkg,
+                                install_path,
+                                size: None,
+                                dependencies: None,
+                                installed_date: None,
+                                last_used: None,
+                                usage_count: None,
+                                checksum: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(packages)
     }
-
-    // ============ CARGO SCANNER ============
 
     fn scan_cargo() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
@@ -199,7 +229,8 @@ impl PackageScanner {
             return Ok(packages);
         }
 
-        let home = home::home_dir().unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/home"));
+        let home =
+            home::home_dir().unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/home"));
         let cargo_bin = home.join(".cargo/bin");
 
         if cargo_bin.exists() {
@@ -233,13 +264,9 @@ impl PackageScanner {
             }
         }
 
-        // Get versions for cargo packages
         let packages_vec: Vec<Package> = packages.iter().cloned().collect();
         for pkg in packages_vec {
-            if let Ok(output) = Command::new(&pkg.install_path)
-                .arg("--version")
-                .output()
-            {
+            if let Ok(output) = Command::new(&pkg.install_path).arg("--version").output() {
                 if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     if let Some(cap) = regex::Regex::new(r"v?(\d+\.\d+\.\d+)")?.captures(&stdout) {
@@ -256,8 +283,6 @@ impl PackageScanner {
 
         Ok(packages)
     }
-
-    // ============ PIP SCANNER ============
 
     fn scan_pip() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
@@ -279,7 +304,8 @@ impl PackageScanner {
 
         let stdout = String::from_utf8(output.stdout)?;
         if let Ok(json) = serde_json::from_str::<Vec<PipPackage>>(&stdout) {
-            let site_packages = PathBuf::from("/data/data/com.termux/files/usr/lib/python3.11/site-packages");
+            let site_packages =
+                PathBuf::from("/data/data/com.termux/files/usr/lib/python3.11/site-packages");
 
             for pkg in json {
                 let install_path = Self::get_pip_location(pip_cmd, &pkg.name, &site_packages);
@@ -304,11 +330,7 @@ impl PackageScanner {
     }
 
     fn get_pip_location(pip_cmd: &str, package: &str, default_path: &PathBuf) -> PathBuf {
-        if let Ok(output) = Command::new(pip_cmd)
-            .arg("show")
-            .arg(package)
-            .output()
-        {
+        if let Ok(output) = Command::new(pip_cmd).arg("show").arg(package).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if line.starts_with("Location:") {
@@ -322,8 +344,6 @@ impl PackageScanner {
         }
         default_path.join(package)
     }
-
-    // ============ NPM SCANNER ============
 
     fn scan_npm() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
@@ -346,10 +366,14 @@ impl PackageScanner {
         let stdout = String::from_utf8(output.stdout)?;
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
             if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
-                let node_modules = PathBuf::from("/data/data/com.termux/files/usr/lib/node_modules");
+                let node_modules =
+                    PathBuf::from("/data/data/com.termux/files/usr/lib/node_modules");
 
                 for (name, info) in deps {
-                    let version = info.get("version").and_then(|v| v.as_str()).map(|v| v.to_string());
+                    let version = info
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_string());
                     let install_path = node_modules.join(name);
                     let size = utils::get_path_size(&install_path);
 
@@ -371,8 +395,6 @@ impl PackageScanner {
 
         Ok(packages)
     }
-
-    // ============ GEM SCANNER ============
 
     fn scan_gem() -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
@@ -419,15 +441,22 @@ impl PackageScanner {
         Ok(packages)
     }
 
-    // ============ MANUAL SCANNER ============
-
-    fn scan_manual(scan_dirs: Vec<PathBuf>, exclude_patterns: Vec<String>) -> Result<HashSet<Package>> {
+    fn scan_manual(
+        scan_dirs: Vec<PathBuf>,
+        exclude_patterns: Vec<String>,
+    ) -> Result<HashSet<Package>> {
         let mut packages = HashSet::new();
 
         let source_dirs = vec![
-            home::home_dir().unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/home")).join("src"),
-            home::home_dir().unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/home")).join("build"),
-            home::home_dir().unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/home")).join("projects"),
+            home::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/home"))
+                .join("src"),
+            home::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/home"))
+                .join("build"),
+            home::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/home"))
+                .join("projects"),
         ];
 
         for path in scan_dirs {
@@ -441,7 +470,8 @@ impl PackageScanner {
                     if entry_path.is_file() {
                         if let Ok(metadata) = entry_path.metadata() {
                             if metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0) {
-                                if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                                if let Some(name) = entry_path.file_name().and_then(|n| n.to_str())
+                                {
                                     let is_excluded = exclude_patterns.iter().any(|pattern| {
                                         if let Ok(re) = regex::Regex::new(pattern) {
                                             re.is_match(name)
@@ -451,7 +481,8 @@ impl PackageScanner {
                                     });
 
                                     if !is_excluded {
-                                        let is_tracked = packages.iter().any(|p: &Package| p.name == name);
+                                        let is_tracked =
+                                            packages.iter().any(|p: &Package| p.name == name);
                                         if !is_tracked {
                                             let size = Some(metadata.len());
                                             packages.insert(Package {
@@ -476,7 +507,6 @@ impl PackageScanner {
             }
         }
 
-        // Scan for build artifacts (Makefile, configure, etc.)
         for dir in source_dirs {
             if dir.exists() {
                 for entry in WalkDir::new(&dir)
@@ -486,14 +516,22 @@ impl PackageScanner {
                 {
                     let entry_path = entry.path();
                     if let Some(filename) = entry_path.file_name().and_then(|n| n.to_str()) {
-                        if filename == "Makefile" || filename == "configure" || filename.ends_with(".sh") {
+                        if filename == "Makefile"
+                            || filename == "configure"
+                            || filename.ends_with(".sh")
+                        {
                             if let Some(parent) = entry_path.parent() {
-                                if let Some(dir_name) = parent.file_name().and_then(|n| n.to_str()) {
+                                if let Some(dir_name) = parent.file_name().and_then(|n| n.to_str())
+                                {
                                     let bin_path = parent.join(dir_name);
                                     if bin_path.exists() {
                                         if let Ok(metadata) = bin_path.metadata() {
-                                            if metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0) {
-                                                let is_tracked = packages.iter().any(|p: &Package| p.name == dir_name);
+                                            if metadata.is_file()
+                                                && (metadata.permissions().mode() & 0o111 != 0)
+                                            {
+                                                let is_tracked = packages
+                                                    .iter()
+                                                    .any(|p: &Package| p.name == dir_name);
                                                 if !is_tracked {
                                                     let size = utils::get_path_size(parent);
                                                     packages.insert(Package {
@@ -523,20 +561,18 @@ impl PackageScanner {
         Ok(packages)
     }
 
-    // ============ POST-PROCESSING ============
-
     fn merge_duplicates(packages: &mut HashSet<Package>) {
         let mut to_remove = Vec::new();
         let mut to_keep = Vec::new();
 
-        let mut names: std::collections::HashMap<String, Vec<Package>> = std::collections::HashMap::new();
+        let mut names: std::collections::HashMap<String, Vec<Package>> =
+            std::collections::HashMap::new();
         for pkg in packages.iter() {
             names.entry(pkg.name.clone()).or_default().push(pkg.clone());
         }
 
-        for (name, pkgs) in names {
+        for (_name, pkgs) in names {
             if pkgs.len() > 1 {
-                // Prefer pkg source over others
                 if let Some(pkg_version) = pkgs.iter().find(|p| p.source == PackageSource::Pkg) {
                     for pkg in &pkgs {
                         if pkg.source != PackageSource::Pkg {
@@ -545,10 +581,11 @@ impl PackageScanner {
                     }
                     to_keep.push(pkg_version.clone());
                 } else {
-                    // Keep the most recently installed
                     let mut sorted = pkgs.clone();
                     sorted.sort_by(|a, b| {
-                        b.installed_date.unwrap_or(0).cmp(&a.installed_date.unwrap_or(0))
+                        b.installed_date
+                            .unwrap_or(0)
+                            .cmp(&a.installed_date.unwrap_or(0))
                     });
                     to_keep.push(sorted[0].clone());
                     for pkg in &sorted[1..] {
@@ -574,7 +611,7 @@ impl PackageScanner {
         for pkg in packages_vec {
             let mut updated = false;
             let mut new_pkg = pkg.clone();
-            
+
             if new_pkg.size.is_none() {
                 new_pkg.size = utils::get_path_size(&new_pkg.install_path);
                 updated = true;
@@ -584,7 +621,8 @@ impl PackageScanner {
                 if let Ok(metadata) = std::fs::metadata(&new_pkg.install_path) {
                     if let Ok(modified) = metadata.modified() {
                         if let Ok(duration) = modified.elapsed() {
-                            let timestamp = chrono::Utc::now().timestamp() - duration.as_secs() as i64;
+                            let timestamp =
+                                chrono::Utc::now().timestamp() - duration.as_secs() as i64;
                             new_pkg.installed_date = Some(timestamp);
                             updated = true;
                         }
@@ -620,3 +658,4 @@ struct GemPackage {
     name: String,
     version: String,
 }
+

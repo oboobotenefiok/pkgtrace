@@ -1,17 +1,15 @@
-use anyhow::Result;
-use crate::{
-    models::*, // Bring in all.
-    models::DependencyGraph, // Wondering why?
-};
+use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 use std::{
-    path::Path,
     fs::File,
     io::Read,
-    path::PathBuf,
-};    
+    path::{Path, PathBuf},
+    process::Command,
+    time::SystemTime,
+};
 use walkdir::WalkDir;
-use sha2::{Sha256, Digest};
 
+use crate::models::{DependencyGraph, Package};
 
 pub fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
@@ -31,17 +29,26 @@ pub fn packages_to_csv(packages: &[Package]) -> Result<String> {
     csv.push_str("Name,Version,Source,Location,Size,InstallDate,LastUsed\n");
 
     for pkg in packages {
-        let size = pkg.size.map(format_size).unwrap_or_else(|| "unknown".to_string());
-        let install_date = pkg.installed_date
-            .map(|ts| chrono::DateTime::from_timestamp(ts, 0)
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "unknown".to_string()))
+        let size = pkg
+            .size
+            .map(format_size)
+            .unwrap_or_else(|| "unknown".to_string());
+        let install_date = pkg
+            .installed_date
+            .map(|ts| {
+                chrono::DateTime::from_timestamp(ts, 0)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
             .unwrap_or_else(|| "unknown".to_string());
 
-        let last_used = pkg.last_used
-            .map(|ts| chrono::DateTime::from_timestamp(ts, 0)
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "unknown".to_string()))
+        let last_used = pkg
+            .last_used
+            .map(|ts| {
+                chrono::DateTime::from_timestamp(ts, 0)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
             .unwrap_or_else(|| "never".to_string());
 
         csv.push_str(&format!(
@@ -66,7 +73,10 @@ pub fn packages_to_markdown(packages: &[Package]) -> Result<String> {
     md.push_str("|------|---------|--------|----------|------|\n");
 
     for pkg in packages {
-        let size = pkg.size.map(format_size).unwrap_or_else(|| "unknown".to_string());
+        let size = pkg
+            .size
+            .map(format_size)
+            .unwrap_or_else(|| "unknown".to_string());
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
             pkg.name,
@@ -134,10 +144,7 @@ pub fn get_path_size(path: &Path) -> Option<u64> {
             total_size = metadata.len();
         }
     } else if path.is_dir() {
-        for entry in WalkDir::new(path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
             if let Ok(metadata) = entry.metadata() {
                 if metadata.is_file() {
                     total_size += metadata.len();
@@ -270,21 +277,84 @@ pub fn get_package_size_summary(packages: &[Package]) -> String {
 }
 
 pub fn get_package_dependency_summary(packages: &[Package]) -> String {
-    let with_deps = packages.iter()
-        .filter(|p| p.dependencies.is_some())
-        .count();
+    let with_deps = packages.iter().filter(|p| p.dependencies.is_some()).count();
 
-    let total_deps: usize = packages.iter()
+    let total_deps: usize = packages
+        .iter()
         .filter_map(|p| p.dependencies.as_ref())
         .map(|d| d.len())
         .sum();
 
-    format!("{} packages have dependencies, {} total dependencies", with_deps, total_deps)
+    format!(
+        "{} packages have dependencies, {} total dependencies",
+        with_deps, total_deps
+    )
+}
+
+pub fn get_dpkg_db_mtime() -> Option<SystemTime> {
+    let db_paths = [
+        "/data/data/com.termux/files/usr/var/lib/dpkg/status",
+        "/data/data/com.termux/files/usr/var/lib/dpkg/available",
+    ];
+
+    let mut latest = None;
+    for path in db_paths {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if let Ok(modified) = metadata.modified() {
+                if latest.is_none() || modified > latest.unwrap() {
+                    latest = Some(modified);
+                }
+            }
+        }
+    }
+    latest
+}
+
+pub fn build_file_package_map() -> Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+
+    let output = Command::new("dpkg").arg("-S").arg("/*").output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!("dpkg -S failed with status: {}", output.status));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    for line in stdout.lines() {
+        if let Some((package, paths)) = line.split_once(':') {
+            let package = package.trim().to_string();
+            for path in paths.split(',').map(|s| s.trim()) {
+                if let Some(filename) = path.split('/').last() {
+                    if !filename.is_empty() {
+                        map.insert(filename.to_string(), package.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(map)
+}
+
+pub fn resolve_filename_to_package(
+    filename: &str,
+    file_map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if let Some(pkg) = file_map.get(filename) {
+        return Some(pkg.clone());
+    }
+    if let Some(stem) = filename.split('.').next() {
+        if let Some(pkg) = file_map.get(stem) {
+            return Some(pkg.clone());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{Package, PackageSource};
     use tempfile::tempdir;
 
     #[test]
@@ -306,10 +376,22 @@ mod tests {
 
     #[test]
     fn test_compare_versions() {
-        assert_eq!(compare_versions("1.2.3", "1.2.3"), Some(std::cmp::Ordering::Equal));
-        assert_eq!(compare_versions("1.2.4", "1.2.3"), Some(std::cmp::Ordering::Greater));
-        assert_eq!(compare_versions("1.1.3", "1.2.3"), Some(std::cmp::Ordering::Less));
-        assert_eq!(compare_versions("1.2.3", "2.0.0"), Some(std::cmp::Ordering::Less));
+        assert_eq!(
+            compare_versions("1.2.3", "1.2.3"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_versions("1.2.4", "1.2.3"),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("1.1.3", "1.2.3"),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("1.2.3", "2.0.0"),
+            Some(std::cmp::Ordering::Less)
+        );
     }
 
     #[test]
@@ -375,5 +457,22 @@ mod tests {
         assert!(md.contains("| test | 1.0.0 | pkg | /usr/bin/test | 1.0 KB |"));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_resolve_filename_to_package() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("nm".to_string(), "binutils".to_string());
+        map.insert("libcrypto.so.3".to_string(), "openssl".to_string());
+
+        assert_eq!(
+            resolve_filename_to_package("nm", &map),
+            Some("binutils".to_string())
+        );
+        assert_eq!(
+            resolve_filename_to_package("libcrypto.so.3", &map),
+            Some("openssl".to_string())
+        );
+        assert_eq!(resolve_filename_to_package("unknown", &map), None);
     }
 }
